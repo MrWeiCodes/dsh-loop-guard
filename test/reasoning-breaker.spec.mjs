@@ -60,6 +60,11 @@ const CONFIG = {
   minRepeatedCycleChars: 512,
   maxRepeatedReasoningCycleChars: 512,
   minRepeatedReasoningCycleChars: 512,
+  // The line-repeat rule is a separate detector with its own suite
+  // (`reasoning-lines.spec.mjs`); switching it off keeps every assertion here
+  // about the verbatim-cycle rule alone.
+  maxRepeatedReasoningLineChars: 0,
+  minRepeatedReasoningLineCoverage: 0.6,
   breakCode: 'REPETITIVE_OUTPUT',
   breakCorrection: true,
 }

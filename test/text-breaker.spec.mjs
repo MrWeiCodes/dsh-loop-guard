@@ -411,7 +411,7 @@ test('a cycled stream is cut through apply() with a terminal error finish', asyn
 
 test('the schema ships the cycle rule on, with its documented defaults', () => {
   const resolved = plugin.Config({})
-  assert.equal(resolved.maxRepeatedCycleChars, 64)
+  assert.equal(resolved.maxRepeatedCycleChars, 512)
   assert.equal(resolved.minRepeatedCycleChars, 256)
   assert.equal(plugin.Config({ maxRepeatedCycleChars: 0 }).maxRepeatedCycleChars, 0, '0 must survive as the off switch')
   assert.throws(() => plugin.Config({ minRepeatedCycleChars: 1 }))
@@ -433,4 +433,79 @@ test('the schema accepts the breaker keys and applies their defaults', () => {
 
 test('the schema rejects a negative repetition threshold', () => {
   assert.throws(() => plugin.Config({ maxRepeatedText: -1 }))
+})
+
+/* -------------------------------------------------------------------------- */
+/* the visible-output period cap — the regression that shipped broken         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A real visible-output bleed, reproduced from a session file: a 44 387-character
+ * assistant message whose loop starts at character 139 and whose exact minimal
+ * period is **172** characters, stable across every tail window from 512 to
+ * 16 384.
+ *
+ * The shape is a small pool of short lines — `好。` / `我写报告。` / `（写）` /
+ * `现在。` — which is why the chunk rule cannot see it (no two consecutive
+ * deltas are equal) and why the *period* is 172 rather than the 12 of the
+ * discussion-#7043 sample.
+ */
+const BLEED_POOL = ['好。', '我写报告。', '（写）', '现在。', '写。', '我写。', '写报告。']
+const BLEED_PERIOD = (() => {
+  let out = ''
+  let i = 0
+  while (out.length < 172) {
+    out += BLEED_POOL[i % BLEED_POOL.length] + '\n'
+    i++
+  }
+  return out.slice(0, 172)
+})()
+
+test('a 172-character period is invisible to the OLD 64 cap and caught by the shipped one', () => {
+  // This is the regression, stated as the two numbers that matter. The old
+  // default was 64; the measured period is 172; `trailingCycle` returns 0 for a
+  // cap below the period, which is a SILENT failure — no fire, no log, and the
+  // call runs to tens of thousands of characters.
+  const text = BLEED_PERIOD.repeat(30)
+  assert.equal(text.length, 5160)
+  assert.equal(plugin.trailingCycle(text, 64, 256), 0, 'the old default could not see it — that was the bug')
+  assert.ok(plugin.trailingCycle(text, 512, 256) > 0, 'the shipped default must see it')
+})
+
+test('the shipped period cap must exceed every measured visible-output period', () => {
+  // The same assertion the reasoning side carries, for the same reason: a cap
+  // below a real period fails silently. Measured periods on this side: 12 and 26
+  // (discussion #7043), and 172 (the 44 387-character bleed).
+  const MEASURED_PERIODS = [12, 26, 172]
+  const cap = plugin.Config({}).maxRepeatedCycleChars
+  for (const period of MEASURED_PERIODS) {
+    assert.ok(cap > period, `cap ${cap} must exceed the measured period ${period}`)
+  }
+})
+
+test('the real 172-period bleed is cut mid-stream through apply()', async () => {
+  // End to end, through the wrapper, on the shipped defaults for the cycle rule:
+  // the assertion that fails if the cap regresses, and the one that proves the
+  // bleed is cut rather than merely measured.
+  const config = { ...CONFIG, maxRepeatedText: 0, maxRepeatedCycleChars: 512, minRepeatedCycleChars: 256 }
+  const agent = fakeAgent()
+  const ctx = fakeContext(agent)
+  plugin.apply(ctx, config)
+  const options = markAgentLoopRequest({ sessionId: 's1', provider: 'p', model: 'm', messages: [] })
+  const total = BLEED_PERIOD.repeat(60)
+  async function* bleeding() {
+    yield { type: 'block-start', index: 0, blockType: 'text' }
+    for (let i = 0; i < total.length; i += 16) {
+      yield { type: 'text-delta', index: 0, text: total.slice(i, i + 16) }
+    }
+  }
+  const out = []
+  for await (const chunk of ctx.fire(options, () => bleeding())) out.push(chunk)
+
+  const emitted = out.filter(c => c.type === 'text-delta').reduce((n, c) => n + c.text.length, 0)
+  assert.ok(emitted < total.length, 'the stream must be cut, not drained')
+  assert.ok(emitted < 2000, `must cut inside the first couple of thousand characters, cut at ${emitted}`)
+  assert.equal(out.at(-1).type, 'finish')
+  assert.equal(out.at(-1).reason.kind, 'stop')
+  assert.equal(agent.steered.length, 1)
 })

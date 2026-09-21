@@ -228,12 +228,41 @@ export interface Config {
   /**
    * Longest repeating period, in visible-output characters, that
    * {@link trailingCycle} will recognize at the tail of a call's output.
-   * `0` disables the cycle rule. Default `64`.
+   * `0` disables the cycle rule. Default `512`.
    *
    * Discussion #7043 reported a model that bleeds a cycle of a few short lines
    * ("好。 / 发。 / 好。 / 好。", and a mixed-language variant) for tens of
    * lines; measured on v0.1.7, that shape never fires `maxRepeatedText` under any
    * chunking, because no two consecutive deltas are identical.
+   *
+   * ## Why the default is 512 and not 64
+   *
+   * The same silent-failure rule that set the reasoning cap applies here, and
+   * this side was left behind. Measured on a real 44 387-character visible-output
+   * bleed: its exact minimal period is **172** characters (stable across every
+   * tail window from 512 to 16 384), and the loop starts at character **139 —
+   * 0.3 %** of the final text. At the old `64` default `trailingCycle` returned
+   * **0** for it, so the guard never fired, the call was never cut, and the text
+   * ran to 44 387 characters until the user stopped the turn by hand.
+   *
+   * A streaming replay of that text through {@link TextRepetitionDetector} — the
+   * real detector, delta by delta, not the settled message — puts the candidate
+   * caps side by side. The figures are for that ONE text:
+   *
+   * | cap | fires on it |
+   * | --- | --- |
+   * | 64 (shipped) | **0** |
+   * | 128 | 0 |
+   * | 256 | 1, cut at character 576 (1.3 %) |
+   * | 512 | 1, cut at character 576 (1.3 %) |
+   *
+   * `512` is chosen over the bare-minimum `256` for the same reason the reasoning
+   * side chose it: a cap below a real period fails *silently*, and the periods
+   * seen on this side have already grown past a previous default once. It costs
+   * nothing in precision — across every visible-output text in the session store
+   * (2 973 texts of 1 500+ characters, all sessions) the cycle rule fires on
+   * exactly one: the real bleed. The other 2 972 legitimate texts — reports,
+   * code, tables — score `0` at every cap from 64 through 4096.
    */
   maxRepeatedCycleChars?: number
   /**
@@ -278,6 +307,34 @@ export interface Config {
    * the reproduction, so the stricter value costs no recall.
    */
   minRepeatedReasoningCycleChars?: number
+  /**
+   * How many characters of *repeated lines* end a reasoning bleed. Default
+   * `2048`, `0` disables the rule.
+   *
+   * The cycle rule above only sees a bleed that repeats in the same order every
+   * time. A measured reproduction recombined a pool of about eleven sentences in
+   * a different order each pass, so it had no period at any cap and the cycle
+   * rule never fired: 330 188 characters until the user aborted. Counting the
+   * mass sitting in lines already seen catches that shape, and the two rules are
+   * complementary — a pool of very short phrases is the cycle rule's job.
+   *
+   * The threshold is deliberately far below the smallest aborted bleed that
+   * matters: the worst measured case is cut at 4096 characters, 1.2 % of its
+   * final length, with no false positive on any of the 119 calls in the same
+   * session that produced text or a tool call.
+   */
+  maxRepeatedReasoningLineChars?: number
+  /**
+   * The share of counted reasoning characters that must sit in repeated lines
+   * before the line rule fires. Default `0.6`.
+   *
+   * Coherent reasoning reuses phrases ("Let me check", "OK") but the bulk of its
+   * text is new, so its repeated share stays low; a bleed drawn from a fixed
+   * pool approaches 1.0. Lines shorter than two characters are excluded from
+   * both the numerator and the denominator, so generated code full of `}` and
+   * `);` cannot drive the ratio up.
+   */
+  minRepeatedReasoningLineCoverage?: number
   /**
    * Error code carried by the breaker's terminal failure. Default
    * `'REPETITIVE_OUTPUT'`.
@@ -332,10 +389,12 @@ export const Config: z<Config> = z.object({
   maxFires: z.number().min(1).default(4),
   cancelCause: z.string().default('thinking-loop'),
   maxRepeatedText: z.number().step(1).min(0).default(60),
-  maxRepeatedCycleChars: z.number().step(1).min(0).default(64),
+  maxRepeatedCycleChars: z.number().step(1).min(0).default(512),
   minRepeatedCycleChars: z.number().step(1).min(2).default(256),
   maxRepeatedReasoningCycleChars: z.number().step(1).min(0).default(512),
   minRepeatedReasoningCycleChars: z.number().step(1).min(2).default(512),
+  maxRepeatedReasoningLineChars: z.number().step(1).min(0).default(2048),
+  minRepeatedReasoningLineCoverage: z.number().min(0).max(1).default(0.6),
   breakCode: z.string().default('REPETITIVE_OUTPUT'),
   breakCorrection: z.boolean().default(true),
   resumeAfterBreak: z.boolean().default(false),
@@ -395,6 +454,26 @@ export const GRAM_SIZE = 4
  * fixed stride keeps the whole rule linear in emitted characters.
  */
 const CYCLE_CHECK_STRIDE = 32
+
+/**
+ * The shortest line the line-repeat rule counts, in characters.
+ *
+ * A line this short or shorter is not evidence of anything: generated code
+ * repeats `}` and `);` by the hundred legitimately, and a brace is one
+ * character. Two characters is the floor at which a line starts carrying
+ * content (`OK`, `Go`), which is exactly the vocabulary a phrase-pool bleed
+ * recombines.
+ */
+const LINE_MIN_CHARS = 2
+
+/**
+ * Which detector ended a call, for the log line, the notice noun and tests.
+ *
+ * `identical-chunks` and `repeating-cycle` watch visible output;
+ * `reasoning-cycle` and `reasoning-lines` watch reasoning under the two
+ * complementary rules described on {@link ReasoningLoopBreaker}.
+ */
+export type BreakRule = 'identical-chunks' | 'repeating-cycle' | 'reasoning-cycle' | 'reasoning-lines'
 
 /**
  * The distinct fixed-length grams of one reasoning text.
@@ -688,6 +767,15 @@ export class ReasoningLoopBreaker {
   private chars = 0
   private reasoning = ''
   private lastCycleCheck = 0
+  private trippedRule: 'reasoning-cycle' | 'reasoning-lines' | undefined
+  /** Trailing text not yet terminated by a newline. */
+  private linePartial = ''
+  /** How many times each counted line has been seen. */
+  private lineCounts = new Map<string, number>()
+  /** Characters sitting in counted lines. */
+  private lineTotal = 0
+  /** Characters sitting in lines that have been seen more than once. */
+  private lineRepeat = 0
 
   /**
    * @param config - the resolved plugin configuration.
@@ -699,6 +787,11 @@ export class ReasoningLoopBreaker {
     return this.broken
   }
 
+  /** Which rule fired, for the log line and for tests. */
+  get trippedBy(): 'reasoning-cycle' | 'reasoning-lines' | undefined {
+    return this.trippedRule
+  }
+
   /** Reasoning characters observed so far in this call (for the break report). */
   get emittedChars(): number {
     return this.chars
@@ -708,13 +801,18 @@ export class ReasoningLoopBreaker {
    * Observe one `reasoning-delta` payload.
    *
    * @param text - the delta's text.
-   * @returns `true` exactly once, on the delta that completes the cycle.
+   * @returns `true` exactly once, on the delta that trips a rule.
    */
   push(text: string): boolean {
     if (this.broken) return false
     this.chars += text.length
-    if (this.config.maxRepeatedReasoningCycleChars <= 0) return false
     this.reasoning += text
+    if (this.pushLines(text)) {
+      this.broken = true
+      this.trippedRule = 'reasoning-lines'
+      return true
+    }
+    if (this.config.maxRepeatedReasoningCycleChars <= 0) return false
     // Same fixed-stride scan as the visible-output rule: the check is bounded by
     // `minRepeatedReasoningCycleChars`, so a bleed that runs for hundreds of
     // thousands of characters is still scanned a bounded number of times.
@@ -727,7 +825,70 @@ export class ReasoningLoopBreaker {
     )
     if (span === 0) return false
     this.broken = true
+    this.trippedRule = 'reasoning-cycle'
     return true
+  }
+
+  /**
+   * The line-repeat rule: a bleed that recombines a small pool of phrases.
+   *
+   * Verbatim periodicity ({@link trailingCycle}) only catches a bleed whose unit
+   * repeats in the same order every time. A real reproduction broke that
+   * assumption: 330 188 reasoning characters drawn from roughly eleven sentences
+   * — `Let me read the section.` / `Executing.` / `Go.` / `Now.` / `Writing.` /
+   * `OK.` / `Let me write.` — **reshuffled** each pass, so no period exists at
+   * any cap (measured: 0 at every cap from 64 to 4096, and the minimum period of
+   * the trailing 8192 characters was 6767, i.e. none). The cycle rule was blind
+   * to it and the turn ran to 330 188 characters until the user aborted.
+   *
+   * What such a bleed *does* have is a tiny line vocabulary. Counting how much
+   * of the text sits in lines already seen separates it cleanly, and the two
+   * rules are complementary rather than redundant: short-phrase bleeds (`Go.`,
+   * `OK.` — under {@link LINE_MIN_CHARS}) are the cycle rule's job, long-phrase
+   * pools are this one's.
+   *
+   * Calibrated on 146 real reasoning calls (17 aborted bleeds, 119 calls that
+   * produced text or a tool call): the shipped thresholds catch the bleed at
+   * **4096 characters — 1.2 % of its 330 188** — with **zero false positives on
+   * all 119 producing calls**, and zero across every parameter set in the sweep
+   * that this one was chosen from.
+   *
+   * Incremental, so the rule stays linear in emitted characters: only complete
+   * lines are counted, and each line is folded in exactly once.
+   *
+   * @param text - the delta's text.
+   * @returns `true` when the repeated mass crosses both thresholds.
+   */
+  private pushLines(text: string): boolean {
+    if (this.config.maxRepeatedReasoningLineChars <= 0) return false
+    this.linePartial += text
+    let idx: number
+    while ((idx = this.linePartial.indexOf('\n')) >= 0) {
+      this.addLine(this.linePartial.slice(0, idx).trim())
+      this.linePartial = this.linePartial.slice(idx + 1)
+    }
+    if (this.lineRepeat < this.config.maxRepeatedReasoningLineChars) return false
+    if (this.lineTotal === 0) return false
+    return this.lineRepeat / this.lineTotal >= this.config.minRepeatedReasoningLineCoverage
+  }
+
+  /**
+   * Fold one complete line into the running counts.
+   *
+   * The repeat mass is maintained rather than recomputed: on the *second*
+   * sighting of a line both copies become repetition, hence `* 2`, and every
+   * sighting after that adds one more copy. Lines below {@link LINE_MIN_CHARS}
+   * are dropped entirely so they never enter the denominator either.
+   *
+   * @param line - the trimmed line.
+   */
+  private addLine(line: string): void {
+    if (line.length < LINE_MIN_CHARS) return
+    const prev = this.lineCounts.get(line) ?? 0
+    this.lineCounts.set(line, prev + 1)
+    this.lineTotal += line.length
+    if (prev === 1) this.lineRepeat += line.length * 2
+    else if (prev > 1) this.lineRepeat += line.length
   }
 }
 
@@ -910,9 +1071,9 @@ function stringsFor(lang: 'zh' | 'en'): Strings {
 }
 
 /** The noun naming what repeated, in the language the model is addressed in. */
-function whatFor(lang: 'zh' | 'en', rule: 'identical-chunks' | 'repeating-cycle' | 'reasoning-cycle'): string {
-  if (lang === 'zh') return rule === 'reasoning-cycle' ? '思考内容' : '可见输出'
-  return rule === 'reasoning-cycle' ? 'reasoning' : 'visible output'
+function whatFor(lang: 'zh' | 'en', rule: BreakRule): string {
+  if (lang === 'zh') return rule === 'identical-chunks' || rule === 'repeating-cycle' ? '可见输出' : '思考内容'
+  return rule === 'identical-chunks' || rule === 'repeating-cycle' ? 'visible output' : 'reasoning'
 }
 
 /**
@@ -1009,7 +1170,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
   function breakStream(
     agent: GuardableAgent,
     chars: number,
-    rule: 'identical-chunks' | 'repeating-cycle' | 'reasoning-cycle',
+    rule: BreakRule,
     open: readonly { index: number; blockType: string; text: string }[],
   ): StreamChunk[] | null {
     // A `stop` finish is only legal with no open block, so every open block must
@@ -1131,7 +1292,7 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
         // harness turn loop never breaks. This is the only detector here that
         // can end such a turn, and it must run mid-stream to do it.
         if (chunk.type === 'reasoning-delta' && reasoningBreaker.push(chunk.text)) {
-          const tail = breakStream(agent, reasoningBreaker.emittedChars, 'reasoning-cycle', openBlocks())
+          const tail = breakStream(agent, reasoningBreaker.emittedChars, reasoningBreaker.trippedBy ?? 'reasoning-cycle', openBlocks())
           if (tail === null) continue
           for (const c of tail) yield c
           return

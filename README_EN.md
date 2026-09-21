@@ -27,14 +27,18 @@ A degenerate loop is precisely the case that calls **no tool at all**: only `rea
 
 This plugin wraps the `llm/stream` waterfall, judges each model call by its chunk composition, and **cuts the stream from the inside** when a model degenerates, letting the turn end normally.
 
+![Effect: a thinking loop is cut, and a correction notice is injected](assets/loop-break-notice.png)
+
+The screenshot above is real output: the reasoning block cycles through `OK. / Writing. / Let me write. / Go. / Executing. / Now.`, the plugin cuts that call once the repetition crosses its threshold, and a notice is injected below to point the model back at its task.
+
 ## Features
 
-- **Four detectors, one per shape**: reasoning-only calls, restated-material calls, intra-call low-entropy repetition, and **a periodic cycle inside reasoning**.
+- **Five detectors, one per shape**: reasoning-only calls, restated-material calls, intra-call low-entropy repetition, a **periodic cycle inside reasoning**, and a **phrase-pool reshuffle inside reasoning**. The last two are complementary; see below.
 - **It can end a turn that would never end**: this is the plugin's core reason to exist. In a degenerate loop the stream never finishes, so any "judge it after the call ends" detector is structurally out of reach; only a cut from inside the stream works.
 - **The task carries on — no manual restart**: a cut ends the current call only. The turn settles normally and the session stays usable, so the work in progress simply continues. That is the difference from "stuck until the user aborts".
-- **It cuts at ~0.1%**: measured, a 357,112-character loop is cut at **512 characters**, and a 134,244-character one at **512**. Previously both ran to completion and needed a manual abort.
-- **Almost no false positives**: **zero** across the 997 calls that produced real output in a real session.
-- **Exact periodicity, not a low-entropy ratio**: the highest-`repeatRatio` non-loop call in that session scores **0.833** but has **no period at all** — a ratio rule would have cut it, the exact rule does not.
+- **It cuts at ~1%**: measured, a **330,188**-character loop is cut at **3,264 characters** (1.0 %), and a 124,070-character one at 17,888 (14.4 %). Previously both ran to completion and needed a manual abort.
+- **Almost no false positives**: **zero** across the 119 calls that produced real output in the calibration session, and zero across all 252 parameter sets the shipped one was chosen from.
+- **Exact rules, not a low-entropy ratio**: the highest-`repeatRatio` non-loop call in that session scores **0.833** but has **no period at all** — a ratio rule would have cut it, the exact rule does not.
 - **The correction points back at the task**: the injected notice says only "stop repeating, carry on" — it never tells the model to "state a conclusion and finish", which derails work in progress.
 - **Reactions do not latch**: one steer often fails to break a strong loop, so the counter resets and fires again (capped by `maxFires`).
 - **It follows the UI language**: the notice reads the host `locale` setting, and defaults to Chinese when it cannot tell.
@@ -209,7 +213,7 @@ interface Config {
   // ── mid-stream cuts (while a call is running) ─────────────
   /** Consecutive identical visible-output chunks before cutting. 0 disables. Default 60. */
   maxRepeatedText?: number
-  /** Longest repeating period of the visible output, in chars. 0 disables. Default 64. */
+  /** Longest repeating period of the visible output, in chars. 0 disables. Default 512. */
   maxRepeatedCycleChars?: number
   /** Shortest visible-output tail that must repeat before the cycle rule fires. Default 256. */
   minRepeatedCycleChars?: number
@@ -217,6 +221,10 @@ interface Config {
   maxRepeatedReasoningCycleChars?: number
   /** Shortest reasoning tail that must repeat before the reasoning rule fires. Default 512. */
   minRepeatedReasoningCycleChars?: number
+  /** Repeated-LINE characters that end a reasoning bleed — **the rule for a period-free phrase pool**. 0 disables. Default 2048. */
+  maxRepeatedReasoningLineChars?: number
+  /** Share of counted reasoning characters that must sit in repeated lines. Default 0.6. */
+  minRepeatedReasoningLineCoverage?: number
 
   // ── behaviour after a cut ─────────────────────────────────
   /** Error code on a mid-stream break. Default 'REPETITIVE_OUTPUT'. */
@@ -260,13 +268,86 @@ They are not guesses. They were calibrated on real sessions (one 174 MB, 4628 ca
 
 | Rule | Result |
 |---|---|
-| `maxPeriod: 64` (the visible-output default) | finds **none** of the bleeds |
+| `maxPeriod: 64` (the **old** visible-output default) | finds **none** of the bleeds |
 | Measured periods | **89 / 102 / 105 / 154 / 187 / 235 / 382 / 409** characters |
 | Productive calls misjudged | **0 / 997** |
 
 **The period cap must sit above every measured period, not in the middle of the ones seen so far.** That rule was learned the hard way: the cap started at `256` (the periods then measured were 89–235), and when real loops turned up with periods of **409** and **382**, `trailingCycle` simply returned 0 — a **silent** failure: no fire, no error, no log, and the turn ran until it was aborted by hand. It is now `512`, and a regression assertion pins "the default must exceed every measured period".
 
+#### The visible-output side fell into the same trap (fixed in v1.0.0)
+
+That lesson was applied **only to the reasoning side**; the visible-output cap was left at `64`, so the same bug happened again — on text.
+
+This time the loop **escaped the reasoning channel and ran in visible output**: the model emitted a pool of short lines — `好。` / `我写报告。` / `（写）` / `现在。` — for **44,387 characters**, until the user stopped it by hand.
+
+| Item | Measured |
+|---|---|
+| Loop length | **44,387** characters |
+| Where the loop starts | character **139** (**0.3 %**) |
+| **Exact minimal period** | **172** characters (identical across tail windows of 512 / 1024 / 2048 / 4096 / 8192 / 16384) |
+| `trailingCycle(text, 64, 256)` (old default) | **0** ← silent failure |
+| `trailingCycle(text, 256, 256)` | 344 |
+| `trailingCycle(text, 512, 512)` | 512 |
+
+Fed to the **real** `TextRepetitionDetector` delta by delta — not the settled message — each candidate cap behaves like this:
+
+| Period cap | Fires |
+|---|---|
+| **64 (old default)** | **0** |
+| 128 | 0 |
+| 256 | 1, cut at character **576 (1.3 %)** |
+| 512 (current default) | 1, cut at character **576 (1.3 %)** |
+
+The period of 172 sits between 128 and 256, which is why both `64` and `128` are blind to it.
+
+**False-positive calibration**: every one of the **2,973 real visible-output texts of ≥1500 characters** in the session store (across several workspaces) was replayed at period caps from 64 through 4096 — the cycle rule fires on **exactly one**, the real bleed. The other 2,972 (reports, code, tables, logs) score `0` at **every** cap.
+
+`512` is chosen over the barely-sufficient `256` for the same reason as on the reasoning side: **a cap below a real period fails silently**, and the measured periods on this side have already grown once (12 → 26 → 172). The extra precision costs nothing — the false-positive count over those 2,973 texts is unchanged at zero.
+
 `minRepeatedReasoningCycleChars` defaults to `512` (stricter than the visible-output `256`): reasoning is private scratch space that legitimately restates a plan, so a longer verbatim run is required before cutting.
+
+### Why a second reasoning rule was needed
+
+**Because raising the period cap can never fix this shape.**
+
+One measured reproduction (a single 330,188-character call) reads like this:
+
+```
+Let me read the section. / Executing. / Go. / Now. / Writing. / OK. / Let me write.
+Go. / Making the call. / Now. / OK. / Let me read. / Go. / Writing. / OK. / Now.
+Let me write. / Go. / Executing. / OK. / Let me read the README section. / Go. / Now.
+```
+
+About **eleven sentences**, **reshuffled** on every pass. So it has **no period at all**:
+
+| Check | Result |
+|---|---|
+| `trailingCycle(tail, cap, 512)` for cap from 64 to 4096 | **0 at every cap** |
+| Minimum period of the trailing 8192 characters | **6767** (≈ the window itself, i.e. none) |
+
+The cycle rule was therefore blind to it, and the turn ran to 330,188 characters until the user aborted by hand. This also explains why the earlier cap bumps (64 → 256 → 512) never fixed this shape: **the cap was never the problem — the criterion was.**
+
+What such a bleed does have is a tiny **line vocabulary**. The second rule counts how much of the text sits in lines already seen.
+
+The two rules are **complementary**, not redundant:
+
+| Bleed shape | Rule that catches it |
+|---|---|
+| Short verbatim period (`Go.` / `OK.`, shorter than 2 chars are not counted) | `reasoning-cycle` |
+| Long-phrase pool, reshuffled | `reasoning-lines` |
+
+Calibration, on the same real session (146 reasoning calls: 17 aborted bleeds, 119 producing calls):
+
+| Item | Result |
+|---|---|
+| The 330,188-character bleed | cut at **3,264 characters (1.0 %)** |
+| The 124,070-character bleed | cut at **17,888 characters (14.4 %)** |
+| Producing calls misjudged | **0 / 119** |
+| Zero-false-positive parameter sets in the sweep | 252, of which this is one |
+
+`minRepeatedReasoningLineCoverage` defaults to `0.6`: coherent reasoning reuses phrasing ("Let me check", "OK") but the bulk of its text is new, so its repeated share stays low, while a phrase-pool loop approaches 1.0.
+
+Lines shorter than two characters are excluded from **both** sides of the ratio — generated code repeats `}` and `);` by the hundred legitimately, and they must not be able to drive the share up.
 
 ## FAQ
 
@@ -282,7 +363,7 @@ Two traces: a "context injected" notice in the UI (`dsh-loop-guard · 已截断�
 
 **Q: Will it cut legitimate long reasoning?**
 
-No. The judgement is **verbatim periodicity**, not duration and not a low-entropy ratio. Measured, zero false positives across 997 productive real calls; generated tables, logs, CSS and JSON are not flagged either.
+No. The judgement is **verbatim periodicity**, not duration and not a low-entropy ratio. Measured, zero false positives across 997 productive real calls; generated tables, logs, CSS and JSON are not flagged either. The visible-output cycle rule was calibrated over **2,973 real long texts** (≥1500 chars, across several workspaces) at period caps from 64 through 4096, with **zero** false positives.
 
 **Q: Why not just retry the request automatically?**
 
