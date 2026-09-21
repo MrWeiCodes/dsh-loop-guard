@@ -1,0 +1,325 @@
+# dsh-loop-guard — Thinking-Loop Guard for DSH
+
+> A thinking-loop guard for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): breaks a model that degrades into a "thinking without doing" loop, so you no longer have to abort the turn by hand
+
+**🌏 [中文](README.md) | English**
+
+`dsh` · `dsh-plugin` · `plugin` · `guard` · `thinking-loop` · `reasoning` · `repetition` · `AI agent` · `思考循环` · `死循环` · `推理退化`
+
+<!-- keywords: dsh, dsh-plugin, deepseek harness, plugin, guard, thinking-loop, reasoning, repetition, circuit-breaker, ai agent, 思考循环, 死循环, 推理退化 -->
+
+## Introduction
+
+Under a long context and a high reasoning effort, a model can **degrade**: its reasoning starts repeating itself at low entropy (`好。执行。好。`, or short lines rotating — `Write. / Output. / Let me write. / Go.`), and then it cannot stop.
+
+What makes this painful is that DSH's built-in `guard/` family **cannot see it** — both guards are tool-call-centric:
+
+| Built-in guard | Hook | Catches |
+|---|---|---|
+| `guard/timeout-policy` | `tools/execute` | a tool call exceeding its declared timeout |
+| `guard/repeat-tool-reminder` | `tools/post-execute` | a repeated chain of the same tool call |
+
+A degenerate loop is precisely the case that calls **no tool at all**: only `reasoning-delta`, zero `text-delta`, zero `tool-call-delta`. So:
+
+- neither guard fires;
+- `agent-loop`'s `turn()` derives `StepEndReason` from a **finished** message, so a stream that never finishes never settles the step, `turnEnds` stays null, and `while (true)` never breaks;
+- **the turn will not end on its own — only a manual abort stops it**, while the UI shows nothing but "thinking", indistinguishable from genuine reasoning. Unless you open the thinking block, you cannot tell it is spinning.
+
+This plugin wraps the `llm/stream` waterfall, judges each model call by its chunk composition, and **cuts the stream from the inside** when a model degenerates, letting the turn end normally.
+
+## Features
+
+- **Four detectors, one per shape**: reasoning-only calls, restated-material calls, intra-call low-entropy repetition, and **a periodic cycle inside reasoning**.
+- **It can end a turn that would never end**: this is the plugin's core reason to exist. In a degenerate loop the stream never finishes, so any "judge it after the call ends" detector is structurally out of reach; only a cut from inside the stream works.
+- **The task carries on — no manual restart**: a cut ends the current call only. The turn settles normally and the session stays usable, so the work in progress simply continues. That is the difference from "stuck until the user aborts".
+- **It cuts at ~0.1%**: measured, a 357,112-character loop is cut at **512 characters**, and a 134,244-character one at **512**. Previously both ran to completion and needed a manual abort.
+- **Almost no false positives**: **zero** across the 997 calls that produced real output in a real session.
+- **Exact periodicity, not a low-entropy ratio**: the highest-`repeatRatio` non-loop call in that session scores **0.833** but has **no period at all** — a ratio rule would have cut it, the exact rule does not.
+- **The correction points back at the task**: the injected notice says only "stop repeating, carry on" — it never tells the model to "state a conclusion and finish", which derails work in progress.
+- **Reactions do not latch**: one steer often fails to break a strong loop, so the counter resets and fires again (capped by `maxFires`).
+- **It follows the UI language**: the notice reads the host `locale` setting, and defaults to Chinese when it cannot tell.
+- **Never a silent retry**: **no** model fallback and no automatic re-send of the same request — re-billing a degenerate model is worse than the loop.
+- **Offline analyzer**: `tools/analyze-session.mjs` replays a session jsonl through the **same detector the plugin runs**, to answer "should this have fired?".
+- **Observable**: a cut writes a warn log naming which rule fired.
+
+## Usage
+
+### Works out of the box
+
+**Install it and it works — no configuration needed.** The defaults are calibrated against real data:
+
+- reasoning-only spinning, restating the previous step, and periodic reasoning cycles → the turn is broken automatically;
+- a single call flooding identical visible output → cut from inside the stream;
+- normal long reasoning and legitimately repetitive output (tables, logs, CSS, JSON) → **not touched**.
+
+### What happens when a call is cut
+
+**The session continues and the task carries on** — you do not restart anything or re-issue the instruction.
+
+| | |
+|---|---|
+| The call | cut; the reasoning produced so far is persisted as an ordinary message |
+| The turn | ends with `turn/end`, reason `{ kind: 'completed' }` — **the same as a normal completion** |
+| The session | **survives**; the agent returns to `idle` and remains usable |
+| Tool calls already made | kept (`tool/result` is not rolled back) |
+| Injected notice | a `notice` explaining that N characters repeated and were cut, and to carry on with the task |
+| Terminal chunk | protocol-legal: every open block is closed first, then a `stop` finish — verified against DSH's own `@deepseek-ai/dsh-llm/invariant` |
+
+So the experience is: **loop → cut within a few hundred characters → the model is pointed back at its task → work continues**.
+
+**Why the turn is `completed` rather than an error**: an earlier version ended the call with an `error` finish. That produced no `assistant/message` (only an `assistant/attempt`), so DSH's conversation renderer threw
+`conversation Definition "assistant-step" withdrew materialized target "chat"`, and `turn()` threw at `throwError` before reaching the line that decides whether another turn opens — crashing the UI *and* making continuation impossible. Closing the blocks and finishing with `stop` puts the call on the ordinary path, which removes both problems at once.
+
+The cost is that **the turn-end reason is no longer distinctive** (`completed` is indistinguishable from a normal finish). The traces live in the injected `notice` and the host warn log. That is a deliberate trade: the point of a break is to keep the session usable, not to raise an alarm.
+
+The plugin **ends the call, never the agent** — it never calls `agent.cancel()`.
+
+### Automatic continuation (`resumeAfterBreak`)
+
+**Usually unnecessary.** A cut does not end the session, so the task already continues; this option only makes it proceed *without waiting for you*:
+
+```yaml
+- id: loop-guard
+  config:
+    resumeAfterBreak: true
+```
+
+```yaml
+- id: loop-guard
+  config:
+    resumeAfterBreak: true
+```
+
+**The waiting is the whole trick, not an implementation detail**: the cut happens inside the stream wrapper, while the agent is still `running`, and DSH deliberately suppresses wakes in that phase — `wakeDriver()` only latches for maintenance or an aborted activity, so a `steer()` / `followup()` issued there sets no `wakeRequested`, `kick()`'s `finally` finds nothing to wake on, and the session settles. A wake only takes effect once the agent is back to `idle`, which is what the plugin waits for via `whenIdle()`.
+
+The continuation **carries the correction text and is never empty**. An empty message would re-enter the model with the same degenerate history and no new instruction — exactly the input that produced the loop.
+
+It is off by default because it re-enters the model without being asked, on a failure where the model has already shown it cannot act on its own. Turn it on for unattended long runs.
+
+## Install
+
+> **Note**: this plugin needs DSH's `llm/stream` waterfall, which is present on every published line from **0.1.2-rc.1** onward.
+
+### Option 1: Let the AI install it (simplest)
+
+Just give the repository URL to DSH's AI assistant, e.g. "install the plugin at https://github.com/MrWeiCodes/dsh-loop-guard". The AI handles the plugin loading, dependencies and patch; then restart `dsh web`.
+
+### Option 2: Install from GitHub
+
+```powershell
+dsh plugin --profile web add -w github:MrWeiCodes/dsh-loop-guard
+```
+
+This installs the source, so `lib/` must be built locally — you **may need to allow the build script in the profile's `pnpm-workspace.yaml`** (pnpm 10 blocks dependency build scripts by default; paste the line it prints and re-run).
+
+> **Known issue installing from a local directory**: on Windows, if the plugin directory and the profile are on **different drives** (plugin on `G:\`, profile on `C:\`), pnpm misresolves the `file:` dependency to `C:\Users\<name>\...` and the install fails. Use Option 3 instead.
+
+### Option 3: Manual install
+
+The fallback when pnpm is unavailable or you are offline:
+
+1. Clone the repository into the profile's plugin directory and build once:
+   ```powershell
+   # example: the web profile
+   $dst = "$HOME\.dsh\profiles\web\packages\dsh-loop-guard"
+   git clone https://github.com/MrWeiCodes/dsh-loop-guard.git $dst
+   cd $dst
+   npm install      # also builds lib/
+   npm run build    # if the previous step did not produce lib/
+   ```
+2. Add it to the profile's `package.json` `dependencies`:
+   ```json
+   "dsh-loop-guard": "file:./packages/dsh-loop-guard"
+   ```
+3. Append the contents of `cordis.patch.yml` to the profile's `cordis.patch.yml`.
+4. Reinstall and restart: `pnpm install` (or `npm install`), then `dsh web`.
+
+## Updating
+
+- **Option 1 (AI install)**: just tell the AI "update the dsh-loop-guard plugin".
+- **Option 2 (GitHub)**: 
+  ```powershell
+  dsh plugin --profile web add -w github:MrWeiCodes/dsh-loop-guard
+  ```
+  If the latest commit is not picked up (git dependencies are cached), remove and re-add:
+  ```powershell
+  dsh plugin --profile web remove dsh-loop-guard
+  dsh plugin --profile web add -w github:MrWeiCodes/dsh-loop-guard
+  ```
+  Then restart `dsh web`. **The commit hash changes after an update**; if pnpm asks for build approval again, redo the step from Option 2.
+- **Option 3 (manual)**:
+  ```powershell
+  cd "$HOME\.dsh\profiles\web\packages\dsh-loop-guard"
+  git pull            # or copy the new version over
+  npm install         # when dependency declarations changed
+  npm run build
+  ```
+  Then restart `dsh web`.
+
+## Uninstalling
+
+### Option 1 (AI install)
+
+Tell the AI assistant "uninstall the dsh-loop-guard plugin"; it removes the plugin and cleans up the patch and dependency.
+
+### Option 2 (GitHub)
+
+```powershell
+dsh plugin --profile web remove dsh-loop-guard
+```
+
+Then restart `dsh web`.
+
+### Option 3 (manual)
+
+1. Remove this plugin's `insert` entry from the profile's `cordis.patch.yml`.
+2. Remove `"dsh-loop-guard": ...` from the profile's `package.json` `dependencies`.
+3. Reinstall and restart: `pnpm install` (or `npm install`), then `dsh web`.
+
+### Leftover locations (for an AI cleanup)
+
+- **Plugin directory** (Option 3 installs): `$DSH_HOME/profiles/<profile>/packages/dsh-loop-guard/`. `$DSH_HOME` defaults to `~/.dsh`.
+- **Dependency and patch** (Option 3 installs): the `"dsh-loop-guard": ...` dependency in the profile's `package.json`, and the `insert` entry in `cordis.patch.yml`.
+- This plugin writes **no configuration file of its own** and has no global registry or system-level writes, so uninstalling leaves nothing behind.
+
+## Configuration
+
+**The defaults work; you normally do not need to touch them.** Only sensitivity and automatic continuation need changing.
+
+### All options
+
+```ts
+interface Config {
+  // ── cross-call judgement (after a call ends) ──────────────
+  /** Consecutive stalled calls before reacting. Default 3. */
+  maxThinkingSteps?: number
+  /** Minimum reasoning length before a call is judged at all. Default 2048 chars. */
+  minReasoningChars?: number
+  /** Intra-call repeated-gram coverage. Language-agnostic (handles CJK). Default 0.5. */
+  repeatRatio?: number
+  /** Cross-call similarity: how much of the previous reasoning must reappear. 0 disables. Default 0.8. */
+  similarityThreshold?: number
+  /** Action on a crossing: 'warn' | 'steer' (default) | 'cancel'. */
+  escalate?: 'warn' | 'steer' | 'cancel'
+  /** How many times one agent may be reacted to. Default 4. */
+  maxFires?: number
+  /** Cancel cause when escalate is 'cancel'. Default 'thinking-loop'. */
+  cancelCause?: string
+
+  // ── mid-stream cuts (while a call is running) ─────────────
+  /** Consecutive identical visible-output chunks before cutting. 0 disables. Default 60. */
+  maxRepeatedText?: number
+  /** Longest repeating period of the visible output, in chars. 0 disables. Default 64. */
+  maxRepeatedCycleChars?: number
+  /** Shortest visible-output tail that must repeat before the cycle rule fires. Default 256. */
+  minRepeatedCycleChars?: number
+  /** Longest repeating period of the REASONING, in chars — **the rule that ends #5976**. 0 disables. Default 512. */
+  maxRepeatedReasoningCycleChars?: number
+  /** Shortest reasoning tail that must repeat before the reasoning rule fires. Default 512. */
+  minRepeatedReasoningCycleChars?: number
+
+  // ── behaviour after a cut ─────────────────────────────────
+  /** Error code on a mid-stream break. Default 'REPETITIVE_OUTPUT'. */
+  breakCode?: string
+  /** Steer once after a cut so the resumed turn is corrected. Default true. */
+  breakCorrection?: boolean
+  /** Wait for the turn to unwind, then continue automatically. Default false. */
+  resumeAfterBreak?: boolean
+}
+```
+
+### Common setups (copy-paste)
+
+```yaml
+# 1. More sensitive: react after 2 stalled calls
+- id: loop-guard
+  config:
+    maxThinkingSteps: 2
+
+# 2. Unattended: pick the work back up after a loop
+- id: loop-guard
+  config:
+    resumeAfterBreak: true
+
+# 3. Keep only the reasoning-cycle rule, disable everything else
+- id: loop-guard
+  config:
+    maxThinkingSteps: 999
+    maxRepeatedText: 0
+    maxRepeatedCycleChars: 0
+
+# 4. Hard stop: no steer, abort the turn
+- id: loop-guard
+  config:
+    escalate: cancel
+```
+
+### How the thresholds were derived
+
+They are not guesses. They were calibrated on real sessions (one 174 MB, 4628 calls, 1005 of them with ≥2048 reasoning characters; later corrected against further reproductions):
+
+| Rule | Result |
+|---|---|
+| `maxPeriod: 64` (the visible-output default) | finds **none** of the bleeds |
+| Measured periods | **89 / 102 / 105 / 154 / 187 / 235 / 382 / 409** characters |
+| Productive calls misjudged | **0 / 997** |
+
+**The period cap must sit above every measured period, not in the middle of the ones seen so far.** That rule was learned the hard way: the cap started at `256` (the periods then measured were 89–235), and when real loops turned up with periods of **409** and **382**, `trailingCycle` simply returned 0 — a **silent** failure: no fire, no error, no log, and the turn ran until it was aborted by hand. It is now `512`, and a regression assertion pins "the default must exceed every measured period".
+
+`minRepeatedReasoningCycleChars` defaults to `512` (stricter than the visible-output `256`): reasoning is private scratch space that legitimately restates a plan, so a longer verbatim run is required before cutting.
+
+## FAQ
+
+**Q: What do I need to do after a cut?**
+
+**Usually nothing.** A cut ends the current call only; the turn settles normally and the session stays usable, so the task simply continues. The injected notice points the model back at its work.
+
+You only need `resumeAfterBreak: true` if you want it to continue *without waiting for you*.
+
+**Q: How do I tell that a cut happened?**
+
+Two traces: a "context injected" notice in the UI (`dsh-loop-guard · 已截断重复的思考内容（N 字符）`) and a warn line in the host log. **The turn-end reason does not show it** — it is `completed`, identical to a normal finish. That is deliberate: the point of a break is to keep the session usable, not to raise an alarm.
+
+**Q: Will it cut legitimate long reasoning?**
+
+No. The judgement is **verbatim periodicity**, not duration and not a low-entropy ratio. Measured, zero false positives across 997 productive real calls; generated tables, logs, CSS and JSON are not flagged either.
+
+**Q: Why not just retry the request automatically?**
+
+Because a retry **re-sends the same request** — the history is unchanged, so the already-degenerate model gets the same input and most likely loops again. It also bypasses the turn boundary, hiding the fact that a loop ever happened. `resumeAfterBreak` opens a **new turn** carrying the correction, which is the better shape.
+
+**Q: Does it switch model or lower the effort?**
+
+No, deliberately. Silently re-billing a degenerate model is worse than the loop.
+
+**Q: Is the reasoning produced before the cut lost?**
+
+No — it is persisted via `assistant/attempt` and readable in the session jsonl. Only unclosed blocks are dropped.
+
+**Q: How do I check whether a past session should have fired?**
+
+Use the offline analyzer, which runs the **same detector the plugin runs**:
+
+```powershell
+node node_modules/dsh-loop-guard/tools/analyze-session.mjs <your-session.jsonl>
+```
+
+It reads both durable formats, `assistant/chunk` (v1) and `assistant/attempt` (v2). Add `--json` for the raw per-step records.
+
+## Development
+
+```powershell
+npm install
+npm run build     # src/ → lib/
+npm test          # run the suite
+```
+
+The suite has three kinds of assertion: pure-function and static checks, runtime checks through a real `llm/stream` chain, and **counter-example regressions built from real session fragments** (`test/fixtures-reasoning-bleed.json`, carrying bleeds with measured periods of 89–235 and a "high `repeatRatio` but no period" normal sample).
+
+One test feeds the plugin's terminal chunk into DSH's own `@deepseek-ai/dsh-llm/invariant`, because the cut happens with the reasoning block still open and only `error`/`aborted` is permitted there.
+
+To customize or modify the plugin, use DSH's Creator mode.
+
+## License
+
+[MIT](LICENSE)

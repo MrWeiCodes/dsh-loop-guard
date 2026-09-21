@@ -1,0 +1,16 @@
+# The dsh-loop-guard bundle patch: the guard needs no
+# deployment-specific config to mount (its defaults detect reasoning-only steps
+# and steer on the second strike). Tune via a profile layer if desired:
+#
+#   - set:
+#       - id: loop-guard
+#         config:
+#           maxThinkingSteps: 3
+#           minReasoningChars: 2048
+#           repeatRatio: 0.5
+#           escalate: steer
+#           cancelCause: thinking-loop
+
+- insert:
+    - id: loop-guard
+      name: 'dsh-loop-guard'
