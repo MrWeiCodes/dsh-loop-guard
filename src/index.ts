@@ -22,7 +22,7 @@
  * carries the same `StreamChunk` delta types, and its `GenerateOptions` carries
  * `sessionId`, from which the live Agent is reachable via `ctx.agents.get(...)`.
  *
- * ## Detection (three shapes, because one does not cover the loop)
+ * ## Detection (two per-call shapes, plus two in-call breakers)
  *
  * Issue #1's re-test on dsh 0.1.2-rc.1 showed the v0.1.2 detector did not fire on
  * the reproduction: the loop recurred with the plugin loaded and working. The
@@ -37,12 +37,15 @@
  *     different wording every step scores near zero on that measure, so it also
  *     slipped through.
  *
- * This version keeps the intra-call measure and adds a cross-call one: the
- * **containment** of the previous call's distinct n-grams in this call's. A step
- * is "stalled" when it either produced no output at all (shape 1) *or* it repeats
- * most of the previous step's distinct reasoning material (shape 2 — the same
- * conclusion reworded, which is what a stuck model actually does). Anything else
- * is genuine progress and resets the run.
+ * The fix for (2) is a **cross-call** measure: the **containment** of the
+ * previous call's distinct n-grams in this call's. A step is "stalled" when it
+ * either produced no output at all (shape 1) *or* it repeats most of the previous
+ * step's distinct reasoning material (shape 2 — the same conclusion reworded,
+ * which is what a stuck model actually does). Anything else is genuine progress
+ * and resets the run.
+ *
+ * The intra-call ratio itself turned out not to be salvageable as a signal and is
+ * no longer wired in; {@link LoopDetector.observe} carries the measurement.
  *
  * ## Mid-stream repetition (issue #2848, v0.1.6)
  *
@@ -187,13 +190,6 @@ export interface Config {
    * short burst is normal. Default `2048` chars.
    */
   minReasoningChars?: number
-  /**
-   * Intra-call low-entropy ratio: coverage of one call's reasoning text by
-   * repeated fixed-length grams. Language-agnostic (handles CJK with no
-   * whitespace): a degenerate "好。执行。" loop is near 1.0; coherent exploration
-   * is low. Only consulted once `minReasoningChars` is met. Default `0.5`.
-   */
-  repeatRatio?: number
   /**
    * Cross-call similarity: how much of the previous call's distinct reasoning
    * material must reappear in this call before the call counts as a repetition
@@ -383,7 +379,6 @@ type ResolvedConfig = Required<Config>
 export const Config: z<Config> = z.object({
   maxThinkingSteps: z.number().min(2).default(3),
   minReasoningChars: z.number().min(256).default(2048),
-  repeatRatio: z.number().min(0).max(1).default(0.5),
   similarityThreshold: z.number().min(0).max(1).default(0.8),
   escalate: z.union(['warn', 'steer', 'cancel']).default('steer'),
   maxFires: z.number().min(1).default(4),
@@ -495,8 +490,21 @@ export function grams(text: string, size = GRAM_SIZE): Set<string> {
 /**
  * Low-entropy ratio: coverage of one text by repeated fixed-length grams.
  *
- * A tight repetition ("好。执行。" x N) scores near 1.0 while coherent reasoning
- * (which rarely repeats a window verbatim) scores near 0.
+ * ## Not a loop detector — do not use it as one
+ *
+ * This is kept as a **diagnostic**, exported for `tools/analyze-session.mjs` and
+ * the tests. It is deliberately no longer wired into {@link LoopDetector}; the
+ * measurement behind that decision is on {@link LoopDetector.observe}.
+ *
+ * The short version: the ratio rises with **length**, because the number of
+ * distinct 4-grams in natural language saturates. One continuous non-repeating
+ * English document scores 0.290 at 2048 characters and 0.629 at 20 000; this
+ * repo's own `README_EN.md` and `src/index.ts` score 0.54-0.65, above the `0.5`
+ * that used to be the threshold, while a genuine periodic loop scores
+ * 0.994-0.999. It separates "long" from "short", not "stuck" from "working".
+ *
+ * A tight repetition ("好。执行。" x N) still scores near 1.0, so it remains a
+ * useful *descriptive* statistic on a text already known to be a loop.
  *
  * @param reasoning - the reasoning text of one call.
  * @returns the fraction of windows that had already appeared in the same text.
@@ -546,8 +554,14 @@ export interface StepObservation {
   readonly reasoning: string
 }
 
-/** Why one call was counted as stalled (`undefined` = it was progress). */
-export type StallReason = 'reasoning-only' | 'repeated-material' | 'low-entropy'
+/**
+ * Why one call was counted as stalled (`undefined` = it was progress).
+ *
+ * Both reasons are structural: no output at all, or the previous call's material
+ * restated. There is deliberately no "low-entropy" member — see
+ * {@link LoopDetector.observe} for the measurement that removed it.
+ */
+export type StallReason = 'reasoning-only' | 'repeated-material'
 
 /**
  * The per-agent detector: accumulates stalled calls and decides when to react.
@@ -579,6 +593,44 @@ export class LoopDetector {
   /**
    * Observe one completed model call.
    *
+   * ## Why there is no intra-call ratio rule here
+   *
+   * An earlier version added a third reason, `low-entropy`: `repeatRatio` at or
+   * above `0.5` on a call that did produce output. It was removed after being
+   * measured on a real 4380-record session, where it fired **12 times and not
+   * once on a loop**:
+   *
+   *  - Of the 36 calls it judged across those 12 fires, **33 (92 %)** were calls
+   *    that had just made a tool call — `edit`, `write`, `read`, `grep`, `pwsh`.
+   *    **Zero** were calls that produced neither output nor a tool call.
+   *  - Across the whole session, on the 152 calls that produced output, it fired
+   *    on **91 (59.9 %)**.
+   *  - No threshold rescues it: the highest ratio on a productive call is
+   *    **0.797** and the lowest on a reasoning-only call is **0.308**, so the
+   *    ranges overlap and no cut-off separates them. At `0.5` it flags 60 % of
+   *    productive calls; at `0.8` it flags none but also misses half the real
+   *    bleeds.
+   *  - The reason is arithmetic, not tuning. `repeatRatio` counts 4-grams
+   *    already seen; the distinct 4-gram count of natural language saturates, so
+   *    the ratio is pushed up by **length**. Scoring one continuous
+   *    non-repeating English document at growing prefixes gives 0.290 at 2048
+   *    characters, 0.495 at 8000, 0.629 at 20 000 — and the repo's own
+   *    `README_EN.md` and `src/index.ts` score 0.54-0.65, i.e. above the
+   *    threshold, while a genuine periodic loop scores 0.994-0.999. Spearman
+   *    rho(length, ratio) = 0.606.
+   *
+   * So the rule was not a loop detector but a "reasoning longer than roughly
+   * 8000 characters" detector. Its cost was not only the wrong steers: `fires` is
+   * a per-agent budget, so four false positives exhausted `maxFires` and left the
+   * guard silent for the rest of the process — the failure recorded in
+   * {@link ReasoningLoopBreaker}'s calibration notes, where the three real bleeds
+   * of a reproduction drew no reaction at all.
+   *
+   * The two reasons that remain are both structural and were clean on the same
+   * data: `reasoning-only` fired on 0 of 152 productive calls, and
+   * `repeated-material` needs 80 % of the previous call's distinct material
+   * restated.
+   *
    * @param step - the call's output shape and reasoning text.
    * @returns the reason it counted as stalled, or `undefined` when it was progress.
    */
@@ -598,9 +650,7 @@ export class LoopDetector {
       ? 'reasoning-only'
       : repeated
         ? 'repeated-material'
-        : repeatRatio(step.reasoning) >= this.config.repeatRatio
-          ? 'low-entropy'
-          : undefined
+        : undefined
 
     if (reason === undefined) {
       // Real progress: the run is over.
@@ -731,8 +781,9 @@ export function trailingCycle(text: string, maxPeriod: number, minSpan: number):
  *
  *  - {@link LoopDetector} judges a call **after** it ends. A bleed that does not
  *    end never reaches it. On the reproduction its `maxFires` budget was already
- *    spent by four `low-entropy` false positives early in the session, so the
- *    three real bleeds produced no reaction at all.
+ *    spent by four false positives early in the session (the `low-entropy` rule,
+ *    since removed — see {@link LoopDetector.observe}), so the three real bleeds
+ *    produced no reaction at all.
  *  - {@link TextRepetitionDetector} watches `text-delta` only, by design, because
  *    visible output is what a repetition is normally visible in. Here the bleed
  *    is entirely in reasoning, so it never saw a chunk.
@@ -1028,16 +1079,12 @@ const EN: Strings = {
   cancel: (d) => `Aborting: ${d}.`,
   detail: (reason) => reason === 'reasoning-only'
     ? 'several long reasoning-only calls with no output'
-    : reason === 'repeated-material'
-      ? 'several calls that restate the same reasoning without adding anything'
-      : 'a self-repeating reasoning loop',
+    : 'several calls that restate the same reasoning without adding anything',
   correction: (what, chars) => `Your ${what} had repeated itself for ${chars} characters without progressing, `
     + 'so the response was cut off mid-stream. Do not repeat it: carry on with the task you were working on.',
   stallSummary: (reason) => reason === 'reasoning-only'
     ? 'stalled: reasoning-only calls'
-    : reason === 'repeated-material'
-      ? 'stalled: restated reasoning'
-      : 'stalled: low-entropy reasoning',
+    : 'stalled: restated reasoning',
   breakSummary: (what, chars) => `cut a repeating ${what} at ${chars} chars`,
 }
 
@@ -1047,9 +1094,7 @@ const ZH: Strings = {
   cancel: (d) => `正在中止：${d}。`,
   detail: (reason) => reason === 'reasoning-only'
     ? '连续多次只输出思考、没有任何产出'
-    : reason === 'repeated-material'
-      ? '连续多次复述同样的推理、没有新增内容'
-      : '自我重复的思考循环',
+    : '连续多次复述同样的推理、没有新增内容',
   // The correction must send the model BACK to its task, not wrap it up. An
   // earlier wording ("state the conclusion once, briefly") read as "finish now"
   // and made the model abandon work in progress — the break ended the loop but
@@ -1059,9 +1104,7 @@ const ZH: Strings = {
     + '不要重复这段内容，继续完成你原本的任务。',
   stallSummary: (reason) => reason === 'reasoning-only'
     ? '空转：仅思考无产出'
-    : reason === 'repeated-material'
-      ? '空转：复述推理'
-      : '空转：低熵重复',
+    : '空转：复述推理',
   breakSummary: (what, chars) => `已截断重复的${what}（${chars} 字符）`,
 }
 

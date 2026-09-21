@@ -33,12 +33,12 @@ The screenshot above is real output: the reasoning block cycles through `OK. / W
 
 ## Features
 
-- **Five detectors, one per shape**: reasoning-only calls, restated-material calls, intra-call low-entropy repetition, a **periodic cycle inside reasoning**, and a **phrase-pool reshuffle inside reasoning**. The last two are complementary; see below.
+- **Four detectors, one per shape**: reasoning-only calls, restated-material calls, a **periodic cycle inside reasoning**, and a **phrase-pool reshuffle inside reasoning**. The last two are complementary; see below.
 - **It can end a turn that would never end**: this is the plugin's core reason to exist. In a degenerate loop the stream never finishes, so any "judge it after the call ends" detector is structurally out of reach; only a cut from inside the stream works.
 - **The task carries on — no manual restart**: a cut ends the current call only. The turn settles normally and the session stays usable, so the work in progress simply continues. That is the difference from "stuck until the user aborts".
 - **It cuts at ~1%**: measured, a **330,188**-character loop is cut at **3,264 characters** (1.0 %), and a 124,070-character one at 17,888 (14.4 %). Previously both ran to completion and needed a manual abort.
 - **Almost no false positives**: **zero** across the 119 calls that produced real output in the calibration session, and zero across all 252 parameter sets the shipped one was chosen from.
-- **Exact rules, not a low-entropy ratio**: the highest-`repeatRatio` non-loop call in that session scores **0.833** but has **no period at all** — a ratio rule would have cut it, the exact rule does not.
+- **Exact rules**: judgement uses **verbatim periodicity** and **cross-call restatement** — not duration, and not a ratio.
 - **The correction points back at the task**: the injected notice says only "stop repeating, carry on" — it never tells the model to "state a conclusion and finish", which derails work in progress.
 - **Reactions do not latch**: one steer often fails to break a strong loop, so the counter resets and fires again (capped by `maxFires`).
 - **It follows the UI language**: the notice reads the host `locale` setting, and defaults to Chinese when it cannot tell.
@@ -199,8 +199,6 @@ interface Config {
   maxThinkingSteps?: number
   /** Minimum reasoning length before a call is judged at all. Default 2048 chars. */
   minReasoningChars?: number
-  /** Intra-call repeated-gram coverage. Language-agnostic (handles CJK). Default 0.5. */
-  repeatRatio?: number
   /** Cross-call similarity: how much of the previous reasoning must reappear. 0 disables. Default 0.8. */
   similarityThreshold?: number
   /** Action on a crossing: 'warn' | 'steer' (default) | 'cancel'. */
@@ -363,7 +361,7 @@ Two traces: a "context injected" notice in the UI (`dsh-loop-guard · 已截断�
 
 **Q: Will it cut legitimate long reasoning?**
 
-No. The judgement is **verbatim periodicity**, not duration and not a low-entropy ratio. Measured, zero false positives across 997 productive real calls; generated tables, logs, CSS and JSON are not flagged either. The visible-output cycle rule was calibrated over **2,973 real long texts** (≥1500 chars, across several workspaces) at period caps from 64 through 4096, with **zero** false positives.
+No. The judgement is **verbatim periodicity** and **cross-call restatement**, not duration and not a ratio. Measured, zero false positives across 997 productive real calls; generated tables, logs, CSS and JSON are not flagged either. The visible-output cycle rule was calibrated over **2,973 real long texts** (≥1500 chars, across several workspaces) at period caps from 64 through 4096, with **zero** false positives.
 
 **Q: Why not just retry the request automatically?**
 

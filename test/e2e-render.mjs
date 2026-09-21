@@ -18,7 +18,7 @@ const FIXTURE = JSON.parse(readFileSync(new URL('./fixtures-reasoning-bleed.json
 const BLEED = FIXTURE.loops.find((l) => l.minPeriod > 0).text.repeat(3)
 
 const CONFIG = {
-  maxThinkingSteps: 3, minReasoningChars: 2048, repeatRatio: 0.5, similarityThreshold: 0.8,
+  maxThinkingSteps: 3, minReasoningChars: 2048, similarityThreshold: 0.8,
   escalate: 'steer', maxFires: 4, cancelCause: 'thinking-loop',
   maxRepeatedText: 0, maxRepeatedCycleChars: 0, minRepeatedCycleChars: 512,
   maxRepeatedReasoningCycleChars: 512, minRepeatedReasoningCycleChars: 512,

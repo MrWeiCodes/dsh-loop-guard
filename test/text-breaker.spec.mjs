@@ -21,7 +21,6 @@ import { TextRepetitionDetector, countRepeatedText } from '../lib/index.js'
 const CONFIG = {
   maxThinkingSteps: 3,
   minReasoningChars: 2048,
-  repeatRatio: 0.5,
   similarityThreshold: 0.8,
   escalate: 'steer',
   maxFires: 4,

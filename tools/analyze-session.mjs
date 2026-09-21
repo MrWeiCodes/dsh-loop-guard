@@ -45,12 +45,15 @@ import { LoopDetector, countRepeatedText, trailingCycle } from '../lib/index.js'
 const DEFAULT_CONFIG = {
   maxThinkingSteps: 3,
   minReasoningChars: 2048,
-  repeatRatio: 0.5,
   similarityThreshold: 0.8,
   maxFires: 4,
   maxRepeatedText: 60,
-  maxRepeatedCycleChars: 64,
+  maxRepeatedCycleChars: 512,
   minRepeatedCycleChars: 256,
+  maxRepeatedReasoningCycleChars: 512,
+  minRepeatedReasoningCycleChars: 512,
+  maxRepeatedReasoningLineChars: 2048,
+  minRepeatedReasoningLineCoverage: 0.6,
 }
 
 function parseArgs(argv) {

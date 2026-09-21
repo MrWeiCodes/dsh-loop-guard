@@ -148,7 +148,7 @@ test('analyzer verdicts agree with the shipped LoopDetector for the same input',
   // ERR_UNSUPPORTED_ESM_URL_SCHEME, so the path form makes this assertion
   // unrunnable on the platform the guard is most used on.
   const { LoopDetector } = await import(new URL('../lib/index.js', import.meta.url).href)
-  const config = { maxThinkingSteps: 2, minReasoningChars: 8, repeatRatio: 0.5, similarityThreshold: 0.8, maxFires: 4 }
+  const config = { maxThinkingSteps: 2, minReasoningChars: 8, similarityThreshold: 0.8, maxFires: 4 }
   const file = writeSession([
     { type: 'assistant/attempt', seq: 0, time: 0, data: { turn: 0, step: 0, stream: [{ type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] }] } },
     { type: 'assistant/attempt', seq: 1, time: 1, data: { turn: 0, step: 1, stream: [
