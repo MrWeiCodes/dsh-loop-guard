@@ -59,6 +59,9 @@ const LINES_ONLY = {
   maxRepeatedReasoningCycleChars: 0,
 }
 
+/** The line rule with its concentration guard disabled (pre-fix behaviour). */
+const NO_CONCENTRATION = { ...LINES_ONLY, minRepeatedReasoningLineConcentration: 0 }
+
 /** Drive the breaker the way the stream wrapper does, in 32-character strides. */
 function run(text, config = LINES_ONLY) {
   const breaker = new ReasoningLoopBreaker(config)
@@ -149,14 +152,19 @@ test('varying reasoning with unique lines never trips the line rule', () => {
 
 test('the SECOND sighting of a line already counts as repetition', () => {
   // Boundary assertion for the counting rule itself. On the second sighting both
-  // copies are repetition, so the repeated mass is `2 * length`; an
-  // implementation that only counted from the third sighting onwards would need
-  // one extra pass and would miss a bleed that is exactly at the threshold.
+  // copies are repetition, so the repeated mass is `2 * length`; an implementation
+  // that only counted from the third sighting onwards would need one extra pass
+  // and would miss a bleed that is exactly at the threshold.
   // Sized so the two readings straddle the default 2048: 1024 * 2 = 2048 trips,
   // 1024 * 1 = 1024 does not.
+  //
+  // The concentration guard is switched off here: one line seen twice has a
+  // concentration of 2 and the guard (default 4) would reject it. This test is
+  // about the counting arithmetic, so it isolates that — the guard's own effect
+  // on this shape is pinned separately below.
   const line = 'x'.repeat(1024)
   const twice = `${line}\n${line}\n`
-  const hit = run(twice)
+  const hit = run(twice, NO_CONCENTRATION)
   assert.ok(hit !== null, 'two sightings of a 1024-character line must reach the 2048 threshold')
   assert.equal(hit.rule, 'reasoning-lines')
 })
@@ -175,7 +183,110 @@ test('every sighting after the second keeps adding to the repeated mass', () => 
 test('the schema ships the line rule on, with its calibrated defaults', () => {
   assert.equal(SHIPPED.maxRepeatedReasoningLineChars, 2048)
   assert.equal(SHIPPED.minRepeatedReasoningLineCoverage, 0.6)
+  assert.equal(SHIPPED.minRepeatedReasoningLineConcentration, 4)
   assert.ok(SHIPPED.maxRepeatedReasoningLineChars > 0, 'the rule is on by default')
+})
+
+/* -------------------------------------------------------------------------- */
+/* the concentration guard: coverage alone cannot tell a pool from a quote     */
+/* -------------------------------------------------------------------------- */
+
+/** Real fragments that were cut by the pre-guard rule but are not bleeds. */
+const QUOTES = JSON.parse(
+  readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures-reasoning-quote.json'), 'utf8'),
+)
+
+/** Per-line sighting counts of a text prefix, the guard's own measure. */
+function vocabulary(text, upto = text.length) {
+  const counts = new Map()
+  for (const raw of text.slice(0, upto).split('\n')) {
+    const line = raw.trim()
+    if (line.length < 2) continue
+    counts.set(line, (counts.get(line) ?? 0) + 1)
+  }
+  let instances = 0
+  for (const count of counts.values()) instances += count
+  return { distinct: counts.size, instances, perLine: counts.size ? instances / counts.size : 0 }
+}
+
+test('the quote fixture reproduces the bug: the pre-guard rule cuts it, the guard does not', () => {
+  const quote = QUOTES.quotes[0]
+  assert.equal(quote.text.length, quote.reasoningChars, 'the measured fragment')
+
+  // Pre-guard behaviour: it fires, and it fires at the very end of the call —
+  // which is the whole point: the cut saved one character and cost a step.
+  const before = run(quote.text, NO_CONCENTRATION)
+  assert.ok(before !== null, 'the pre-guard rule must still fire on this fixture')
+  assert.equal(before.rule, 'reasoning-lines')
+  assert.ok(
+    before.at >= quote.reasoningChars - 4,
+    `the pre-guard cut lands at the very end, got ${before.at} of ${quote.reasoningChars}`,
+  )
+
+  // With the guard: no fire at all.
+  assert.equal(run(quote.text), null, 'the concentration guard must reject a code quote')
+})
+
+test('the quote fixture is rejected because its vocabulary is not a pool', () => {
+  // The guard's own justification, asserted rather than described: this text
+  // clears the coverage threshold while averaging well under 4 sightings per
+  // distinct line, because a code block quoted twice puts every line in the
+  // "seen twice" bucket.
+  const quote = QUOTES.quotes[0]
+  const vocab = vocabulary(quote.text)
+  assert.equal(vocab.distinct, quote.measured.distinctLines)
+  assert.equal(vocab.instances, quote.measured.instances)
+  assert.ok(vocab.perLine < SHIPPED.minRepeatedReasoningLineConcentration,
+    `per-line ${vocab.perLine.toFixed(2)} must sit below the guard`)
+  // And it does clear the coverage threshold, which is why the guard is needed.
+  const withoutGuard = run(quote.text, NO_CONCENTRATION)
+  assert.ok(withoutGuard !== null, 'coverage alone lets this through')
+})
+
+test('the guard costs nothing on a real bleed: the trip point does not move', () => {
+  // The load-bearing property. A guard that merely delayed the cut would trade
+  // one false positive for a slower true positive; this one must not.
+  for (const bleed of FIXTURE.bleeds) {
+    const before = run(bleed.head, NO_CONCENTRATION)
+    const after = run(bleed.head)
+    assert.ok(before !== null, `bleed seq=${bleed.seq} trips without the guard`)
+    assert.ok(after !== null, `bleed seq=${bleed.seq} must still trip WITH the guard`)
+    assert.equal(after.at, before.at, `bleed seq=${bleed.seq} trip point must be unchanged`)
+    assert.equal(after.rule, 'reasoning-lines')
+  }
+})
+
+test('a bleed drawn from a pool trips at the same character with and without the guard', () => {
+  // Synthetic, so the shape is exact: a small pool repeated many times. This is
+  // what the guard is supposed to keep, and it must keep it at full speed.
+  const pool = 'Let me read the section.\nExecuting.\nGo.\nNow.\nWriting.\nOK.\nLet me write.\n'
+  const text = pool.repeat(60)
+  const before = run(text, NO_CONCENTRATION)
+  const after = run(text)
+  assert.ok(before !== null, 'the pool trips without the guard')
+  assert.ok(after !== null, 'the pool must still trip with the guard')
+  assert.equal(after.at, before.at, 'the guard must not delay a real pool')
+})
+
+test('the guard separates the two populations with margin, not by a hair', () => {
+  // Measured over every session on this machine: rejected quotes score 1.40-2.48
+  // sightings per line, kept bleeds score 7.16-22.99 at their trip point. The
+  // shipped default of 4 sits between them. This asserts the margin on the
+  // fixtures the suite actually carries, so a retune that closes the gap fails.
+  const quote = QUOTES.quotes[0]
+  const quoteVocab = vocabulary(quote.text)
+  const bleedVocab = vocabulary(FIXTURE.bleeds[0].head, run(FIXTURE.bleeds[0].head).at)
+  assert.ok(quoteVocab.perLine < SHIPPED.minRepeatedReasoningLineConcentration)
+  assert.ok(bleedVocab.perLine > SHIPPED.minRepeatedReasoningLineConcentration * 1.5,
+    `a real bleed should clear the guard by a wide margin, got ${bleedVocab.perLine.toFixed(2)}`)
+})
+
+test('`minRepeatedReasoningLineConcentration: 0` restores the pre-guard behaviour', () => {
+  // The escape hatch must be real, not nominal: setting it to 0 has to bring the
+  // false positive back, or it is not actually the knob it claims to be.
+  const quote = QUOTES.quotes[0]
+  assert.equal(run(quote.text), null)
+  assert.ok(run(quote.text, NO_CONCENTRATION) !== null)
 })
 
 test('`maxRepeatedReasoningLineChars: 0` disables the rule', () => {

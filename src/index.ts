@@ -332,6 +332,44 @@ export interface Config {
    */
   minRepeatedReasoningLineCoverage?: number
   /**
+   * How concentrated the line vocabulary must be before the line rule fires:
+   * the average number of sightings per distinct line. Default `4`.
+   *
+   * ## Why the coverage threshold alone is not enough
+   *
+   * `addLine` contributes `len * k` for a line seen `k >= 2` times, so the
+   * "repeated mass" is exactly the total length of every line that appears at
+   * least twice. The coverage ratio is therefore
+   * `chars in lines seen >= 2x / chars in all lines`, and a model that quotes one
+   * code block **twice** — the "before" and "after" of an edit it is planning —
+   * puts almost all of its mass in lines seen exactly twice. Coverage approaches
+   * 1.0 while the vocabulary is not a pool at all.
+   *
+   * Measured on a real reproduction (a 3713-character planning call that quoted
+   * `chatStream` and `probeEffort` before and after): 58 distinct lines across
+   * 104 sightings, i.e. **1.79 sightings per line**, coverage 0.640. The shipped
+   * thresholds (2048 / 0.6) were cleared with 30 characters and 0.04 of margin to
+   * spare, and the cut landed at character 3712 of 3713 — it saved nothing and
+   * cost the turn a step.
+   *
+   * Across every session on this machine, the two populations separate cleanly at
+   * the tripping delta:
+   *
+   * | shape | sightings per distinct line |
+   * | --- | --- |
+   * | real phrase-pool bleeds (28) | **6.4 - 84** |
+   * | code-quoting calls (12) | **1.41 - 2.48** |
+   *
+   * `4` sits between them with a factor of ~1.6 on each side, and costs nothing
+   * on the true positives: every real bleed trips at exactly the same character
+   * with and without the guard.
+   *
+   * A large pool repeated few times (100 lines x 3) scores `3` and is rejected
+   * here — that shape is {@link trailingCycle}'s job, and it catches it: 24 of
+   * those 28 bleeds trip the cycle rule too.
+   */
+  minRepeatedReasoningLineConcentration?: number
+  /**
    * Error code carried by the breaker's terminal failure. Default
    * `'REPETITIVE_OUTPUT'`.
    *
@@ -390,6 +428,7 @@ export const Config: z<Config> = z.object({
   minRepeatedReasoningCycleChars: z.number().step(1).min(2).default(512),
   maxRepeatedReasoningLineChars: z.number().step(1).min(0).default(2048),
   minRepeatedReasoningLineCoverage: z.number().min(0).max(1).default(0.6),
+  minRepeatedReasoningLineConcentration: z.number().min(0).default(4),
   breakCode: z.string().default('REPETITIVE_OUTPUT'),
   breakCorrection: z.boolean().default(true),
   resumeAfterBreak: z.boolean().default(false),
@@ -827,6 +866,8 @@ export class ReasoningLoopBreaker {
   private lineTotal = 0
   /** Characters sitting in lines that have been seen more than once. */
   private lineRepeat = 0
+  /** Total sightings of counted lines (the denominator of the concentration). */
+  private lineInstances = 0
 
   /**
    * @param config - the resolved plugin configuration.
@@ -904,11 +945,23 @@ export class ReasoningLoopBreaker {
    * all 119 producing calls**, and zero across every parameter set in the sweep
    * that this one was chosen from.
    *
+   * ## What that control set could not see
+   *
+   * The 119-call control contains only calls that **produced output**, so it
+   * structurally excludes reasoning-only calls — which is exactly where a
+   * planning call that quotes code lives. Re-measured over every session on this
+   * machine (85 firings), the coverage threshold alone fires on 12 calls that are
+   * quoting a code block before and after an edit rather than bleeding, with a
+   * vocabulary of 1.4-2.5 sightings per line. One of them was cut for real, at
+   * character 3712 of 3713 — see
+   * {@link Config.minRepeatedReasoningLineConcentration} for the guard that
+   * separates the two shapes and the margin it leaves.
+   *
    * Incremental, so the rule stays linear in emitted characters: only complete
    * lines are counted, and each line is folded in exactly once.
    *
    * @param text - the delta's text.
-   * @returns `true` when the repeated mass crosses both thresholds.
+   * @returns `true` when the repeated mass crosses every threshold.
    */
   private pushLines(text: string): boolean {
     if (this.config.maxRepeatedReasoningLineChars <= 0) return false
@@ -920,7 +973,11 @@ export class ReasoningLoopBreaker {
     }
     if (this.lineRepeat < this.config.maxRepeatedReasoningLineChars) return false
     if (this.lineTotal === 0) return false
-    return this.lineRepeat / this.lineTotal >= this.config.minRepeatedReasoningLineCoverage
+    if (this.lineRepeat / this.lineTotal < this.config.minRepeatedReasoningLineCoverage) return false
+    // The concentration guard: coverage alone cannot tell a phrase pool from one
+    // long code block quoted twice. See the config field for the measurement.
+    if (this.lineCounts.size === 0) return false
+    return this.lineInstances / this.lineCounts.size >= this.config.minRepeatedReasoningLineConcentration
   }
 
   /**
@@ -938,6 +995,7 @@ export class ReasoningLoopBreaker {
     const prev = this.lineCounts.get(line) ?? 0
     this.lineCounts.set(line, prev + 1)
     this.lineTotal += line.length
+    this.lineInstances += 1
     if (prev === 1) this.lineRepeat += line.length * 2
     else if (prev > 1) this.lineRepeat += line.length
   }

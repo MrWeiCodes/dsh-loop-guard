@@ -1,7 +1,7 @@
 {
   "name": "dsh-loop-guard",
   "description": "Thinking-loop guard for dsh: observes the llm/stream waterfall and breaks a model that degrades into a loop. Detects two per-call shapes (reasoning-only calls, restated-material calls) and re-fires instead of latching; plus two mid-stream breakers that end a single degenerate call (maxRepeatedText / maxRepeatedCycleChars for visible output, maxRepeatedReasoningCycleChars for a reasoning bleed), which no post-call detector can reach — the reasoning rule is what ends the never-finishing turn of issue #5976. Ships an offline session analyzer that replays a session jsonl through the same detector. Compatible with every published dsh line from 0.1.2-rc.1 through 0.1.6-alpha.2.",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",

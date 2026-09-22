@@ -54,6 +54,7 @@ const DEFAULT_CONFIG = {
   minRepeatedReasoningCycleChars: 512,
   maxRepeatedReasoningLineChars: 2048,
   minRepeatedReasoningLineCoverage: 0.6,
+  minRepeatedReasoningLineConcentration: 4,
 }
 
 function parseArgs(argv) {

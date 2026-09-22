@@ -37,7 +37,7 @@ The screenshot above is real output: the reasoning block cycles through `OK. / W
 - **It can end a turn that would never end**: this is the plugin's core reason to exist. In a degenerate loop the stream never finishes, so any "judge it after the call ends" detector is structurally out of reach; only a cut from inside the stream works.
 - **The task carries on — no manual restart**: a cut ends the current call only. The turn settles normally and the session stays usable, so the work in progress simply continues. That is the difference from "stuck until the user aborts".
 - **It cuts at ~1%**: measured, a **330,188**-character loop is cut at **3,264 characters** (1.0 %), and a 124,070-character one at 17,888 (14.4 %). Previously both ran to completion and needed a manual abort.
-- **Almost no false positives**: **zero** across the 119 calls that produced real output in the calibration session, and zero across all 252 parameter sets the shipped one was chosen from.
+- **Almost no false positives**: **zero** across the 119 calls that produced real output in the calibration session; over all 735 sessions on this machine, 12 of 40 firings were misjudgements (all of them "quote the code before and after an edit"), now rejected by the concentration guard — see below.
 - **Exact rules**: judgement uses **verbatim periodicity** and **cross-call restatement** — not duration, and not a ratio.
 - **The correction points back at the task**: the injected notice says only "stop repeating, carry on" — it never tells the model to "state a conclusion and finish", which derails work in progress.
 - **Reactions do not latch**: one steer often fails to break a strong loop, so the counter resets and fires again (capped by `maxFires`).
@@ -223,6 +223,8 @@ interface Config {
   maxRepeatedReasoningLineChars?: number
   /** Share of counted reasoning characters that must sit in repeated lines. Default 0.6. */
   minRepeatedReasoningLineCoverage?: number
+  /** How concentrated the line vocabulary must be: average sightings per distinct line. Default 4. */
+  minRepeatedReasoningLineConcentration?: number
 
   // ── behaviour after a cut ─────────────────────────────────
   /** Error code on a mid-stream break. Default 'REPETITIVE_OUTPUT'. */
@@ -343,9 +345,30 @@ Calibration, on the same real session (146 reasoning calls: 17 aborted bleeds, 1
 | Producing calls misjudged | **0 / 119** |
 | Zero-false-positive parameter sets in the sweep | 252, of which this is one |
 
+> That control set contains only calls that **produced output**, so it cannot see a reasoning-only call. Re-scanned over all 735 sessions with the concentration guard (40 firings): all **28** real bleeds kept with an **unchanged trip point**, all **12** misjudgements rejected. See below.
+
 `minRepeatedReasoningLineCoverage` defaults to `0.6`: coherent reasoning reuses phrasing ("Let me check", "OK") but the bulk of its text is new, so its repeated share stays low, while a phrase-pool loop approaches 1.0.
 
 Lines shorter than two characters are excluded from **both** sides of the ratio — generated code repeats `}` and `);` by the hundred legitimately, and they must not be able to drive the share up.
+
+### Why `minRepeatedReasoningLineConcentration` is also needed
+
+That "0 / 119" control set contains only calls that **produced output**, so it structurally cannot see a reasoning-only call — which is exactly where a planning call that quotes code lives.
+
+`addLine` contributes `len * k` for a line seen `k >= 2` times, so the "repeated mass" is exactly the total length of every line appearing at least twice. Quoting one code block **twice** (the "before" and "after" of an edit) therefore puts almost all of its mass in lines seen exactly twice, and the coverage ratio approaches 1.0 on its own. The share cannot tell a small pool cycling from one large text appearing twice.
+
+Measured on the real false positive (a 3,713-character planning call quoting `chatStream` and `probeEffort` before and after): 58 distinct lines across 104 sightings, i.e. **1.79 sightings per line**, coverage 0.640. Both thresholds were cleared with almost nothing to spare, and the cut landed at character **3,712 of 3,713** — it saved nothing and cost the turn a step.
+
+Scanning every session on this machine, the two populations separate cleanly **at the tripping delta**:
+
+| Shape | Sightings per distinct line |
+| --- | --- |
+| Real phrase-pool bleeds (28) | **7.16 - 22.99** |
+| Code quoting / planning (12) | **1.40 - 2.48** |
+
+The default `4` sits between them with a factor of ~1.6 on each side, and it costs the true positives nothing: all 28 real bleeds trip at **exactly the same character** with and without the guard.
+
+`0` disables the guard (the pre-1.0.2 behaviour).
 
 ## FAQ
 
@@ -370,6 +393,14 @@ Because a retry **re-sends the same request** — the history is unchanged, so t
 **Q: Does it switch model or lower the effort?**
 
 No, deliberately. Silently re-billing a degenerate model is worse than the loop.
+
+**Q: I got cut off while quoting code before/after an edit — is that a false positive?**
+
+Yes, and it was a **real defect, fixed in 1.0.2**. Quoting one code block twice drives the repeated-line share toward 1.0, and the old rule mistook that for a phrase pool. The cut landed at character 3,712 of 3,713 — almost no lead time, and the turn lost a step.
+
+`minRepeatedReasoningLineConcentration` (default `4`) now rejects it: real bleeds average 7+ sightings per line, code quoting 1.4-2.5. The fix costs the true positives nothing — all 28 real bleeds trip at exactly the same character as before.
+
+Set it to `0` to restore the old behaviour.
 
 **Q: Is the reasoning produced before the cut lost?**
 
