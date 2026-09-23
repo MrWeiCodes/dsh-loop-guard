@@ -767,10 +767,10 @@ test('the service is read through ctx.get, not the throwing ctx.settings proxy',
 })
 
 test('the notice is attributed to the package, with an account of what happened', async () => {
-  // `plugin` is the attribution row in the transcript, so it must be the package
-  // name rather than an internal id; `summary` is the collapsed row's one-line
-  // account, so it must describe the event rather than repeat the plugin name —
-  // otherwise the row reads "dsh-loop-guard · dsh-loop-guard" and says nothing.
+  // The source kind is this plugin's own id (declared by the module augmentation
+  // in `src/index.ts`), not a shared catch-all. `summary` is the collapsed row's
+  // one-line account, so it must describe the event rather than repeat the kind —
+  // otherwise the row reads "loop-guard · loop-guard" and says nothing.
   const steered = []
   const agent = { steer: (m) => steered.push(m), inject: () => {}, cancel: () => {} }
   let listener = null
@@ -785,10 +785,11 @@ test('the notice is attributed to the package, with an account of what happened'
   for await (const _ of listener(options, () => reasoningStream(BLEED))) { /* drain */ }
 
   const source = steered[0].source
-  assert.equal(source.kind, 'plugin')
-  assert.equal(source.plugin, 'dsh-loop-guard')
+  // The plugin's own kind, not a shared catch-all. A host that does not know this
+  // kind falls through it, which is the documented contract.
+  assert.equal(source.kind, 'loop-guard')
   assert.equal(source.form, 'notice')
-  assert.notEqual(source.summary, source.plugin, 'the summary must not merely repeat the plugin name')
+  assert.notEqual(source.summary, source.kind, 'the summary must not merely repeat the kind')
   assert.ok(source.summary.length > 0)
   // The summary rides a collapsed row and is committed to the durable log, so it
   // is bounded; exceeding the cap would be truncated by the harness anyway.
@@ -914,7 +915,7 @@ test('the notice carries the repetition figure, not the call length', async () =
   const out = await drive(stream, reasoningChunks(text))
   assert.ok(out.some((c) => c.type === 'finish'), 'the call was ended')
 
-  const notice = steered.find((m) => m.source?.kind === 'plugin')
+  const notice = steered.find((m) => m.source?.kind === 'loop-guard')
   assert.ok(notice, 'a correction was steered')
   const body = notice.content.map((b) => b.text).join('')
   const number = Number((body.match(/(\d+)/) ?? [])[1])

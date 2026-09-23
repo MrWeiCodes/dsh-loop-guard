@@ -163,7 +163,7 @@ import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { Agent, AgentCancelCause } from '@deepseek-ai/dsh-agent'
 import { createUserMessage, isAgentLoopRequest } from '@deepseek-ai/dsh-llm'
-import type { LlmFailure, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { ContextFormed, LlmFailure, StreamChunk } from '@deepseek-ai/dsh-llm'
 
 type UserMessage = ReturnType<typeof createUserMessage>
 
@@ -452,15 +452,34 @@ export const name = 'loop-guard'
  */
 export const inject = ['agents']
 
-const PLUGIN_SOURCE = { kind: 'plugin', plugin: 'dsh-loop-guard' } as const
+/**
+ * Register this plugin's own message-source kind with the harness.
+ *
+ * `MessageSourceMap` is a merge-extensible sum type: each producer declares its
+ * own `kind` in its own module. The augmentation is what makes
+ * `source: { kind: 'loop-guard', ... }` typecheck, and it is additive — consumers
+ * fall through unknown kinds, so it cannot break a host that has never heard of
+ * us. Declared this way rather than by widening our own literal, so the compiler
+ * still rejects a misspelled kind.
+ */
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'loop-guard': {
+      kind: 'loop-guard'
+    } & ContextFormed
+  }
+}
+
+/** The attribution this plugin stamps on every notice it injects. */
+const PLUGIN_SOURCE = { kind: 'loop-guard' } as const
 
 /**
  * Build one model-facing notice from the guard.
  *
- * `plugin` is the identity shown in the transcript's attribution row, so it
- * carries the package name. `summary` is a one-line account of *what happened*
- * — the collapsed transcript row renders it, and `boundContextSummary` caps it
- * at {@link CONTEXT_SUMMARY_MAX_CHARS} — so it states the event rather than
+ * The source kind is the plugin's own id, which is what the transcript's
+ * attribution row renders. `summary` is a one-line account of *what happened* —
+ * the collapsed transcript row renders it, and `boundContextSummary` caps it at
+ * {@link CONTEXT_SUMMARY_MAX_CHARS} — so it states the event rather than
  * repeating the plugin name, the way `guard/repeat-tool-reminder` summarises as
  * `<tool> × <count>`.
  *

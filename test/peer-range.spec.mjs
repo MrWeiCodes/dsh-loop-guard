@@ -7,7 +7,7 @@ const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url),
 
 /**
  * Every `@deepseek-ai/dsh-agent` / `@deepseek-ai/dsh-llm` version published as
- * of 2026-09-18, oldest first; `npm view @deepseek-ai/dsh-agent versions`
+ * of 2026-09-23, oldest first; `npm view @deepseek-ai/dsh-agent versions`
  * refreshes it.
  *
  * The list is deliberately frozen: it is a record of what the range was checked
@@ -21,23 +21,31 @@ const PUBLISHED = [
   '0.1.2-alpha.2', '0.1.2-alpha.3', '0.1.2-alpha.4', '0.1.2-alpha.5',
   '0.1.2-rc.1',
   '0.1.3-alpha.2',
-  '0.1.5-alpha.1', '0.1.5-alpha.2', '0.1.5-rc.1', '0.1.5-rc.2',
+  '0.1.5-alpha.1', '0.1.5-alpha.2', '0.1.5-rc.1', '0.1.5-rc.2', '0.1.5-rc.3',
   '0.1.6-alpha.1', '0.1.6-alpha.2',
+  '0.1.7-alpha.1', '0.1.7-alpha.2', '0.1.7-rc.1',
 ]
 
 /**
- * The versions this plugin is expected to install against. Each one has had the
- * full suite run against it with every dsh peer pinned to that single line
- * (`npx tsc && node --test`), not just a surface grep: 49/49 pass on all eight.
+ * The versions this plugin is expected to install against.
+ *
  * The seam the guard wraps (`llm/stream`) plus the three symbols it imports
  * (`createUserMessage`, `isAgentLoopRequest`, `markAgentLoopRequest`) predate
- * all of them, so nothing here is claimed on faith.
+ * all of them.
+ *
+ * ## Pinning a version line means pinning the WHOLE set
+ *
+ * Pinning only `dsh-llm` leaves a second copy nested under `dsh-session`, whose
+ * own dependency still points at the newer line. Two copies of the branded
+ * `MessageId` then produce a spurious "Property '[BRAND]' is missing" error that
+ * looks like a plugin defect. Move every `@deepseek-ai` devDependency together.
  */
 const SUPPORTED = [
   '0.1.2-rc.1',
   '0.1.3-alpha.2',
-  '0.1.5-alpha.1', '0.1.5-alpha.2', '0.1.5-rc.1', '0.1.5-rc.2',
+  '0.1.5-alpha.1', '0.1.5-alpha.2', '0.1.5-rc.1', '0.1.5-rc.2', '0.1.5-rc.3',
   '0.1.6-alpha.1', '0.1.6-alpha.2',
+  '0.1.7-alpha.1', '0.1.7-alpha.2', '0.1.7-rc.1',
 ]
 
 /**
