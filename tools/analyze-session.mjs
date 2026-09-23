@@ -40,7 +40,7 @@
  * is pointed at to answer whether the shipped plugin would have cut it.
  */
 import { readFileSync } from 'node:fs'
-import { LoopDetector, countRepeatedText, trailingCycle } from '../lib/index.js'
+import { LoopDetector, countRepeatedText, trailingCycle, periodicTailSpan } from '../lib/index.js'
 
 const DEFAULT_CONFIG = {
   maxThinkingSteps: 3,
@@ -198,6 +198,12 @@ for (const [index, step] of steps.entries()) {
   const byChunks = config.maxRepeatedText > 0 && repeatRun >= config.maxRepeatedText
   const byCycle = cycleSpan > 0
   const wouldBreakBy = byChunks ? 'identical-chunks' : (byCycle ? 'repeating-cycle' : null)
+  // The figure the notice would print. `cycleSpan` above is the DECISION rule's
+  // capped lower bound; the notice reports the true extent of the repetition, so
+  // the tool has to report the same number or it misrepresents the plugin.
+  const repeatedChars = byChunks
+    ? repeatRun * (step.texts.at(-1)?.length ?? 0)
+    : (byCycle ? periodicTailSpan(step.texts.join(''), config.maxRepeatedCycleChars, config.minRepeatedCycleChars) : 0)
   report.push({
     step: index + 1,
     turn: step.turn,
@@ -213,6 +219,7 @@ for (const [index, step] of steps.entries()) {
     // breaker would have ended this call mid-stream.
     repeatedRun: repeatRun,
     cycleSpan,
+    repeatedChars,
     wouldBreak: wouldBreakBy !== null,
     wouldBreakBy,
   })
@@ -226,13 +233,14 @@ if (asJson) {
   console.log(`config:  ${JSON.stringify(config)}`)
   console.log(`steps:   ${steps.length} model call(s)`)
   console.log('')
-  console.log('  #   turn/step   reasonChars  textChars  chunks  verdict             fired  repeatedRun  cycleSpan  break')
+  console.log('  #   turn/step   reasonChars  textChars  chunks  verdict             fired  repeatedRun  cycleSpan  repeatedChars  break')
   for (const row of report) {
     console.log(
       `  ${String(row.step).padStart(2)}  ${String(row.turn)}/${String(row.call)}`.padEnd(20)
       + `${String(row.reasoningChars).padStart(9)}  ${String(row.textChars).padStart(9)}  `
       + `${String(row.textChunks).padStart(6)}  ${row.verdict.padEnd(18)}  ${String(row.fired ?? '').padEnd(5)}  `
       + `${String(row.repeatedRun).padStart(11)}  ${String(row.cycleSpan).padStart(9)}  `
+      + `${String(row.repeatedChars).padStart(13)}  `
       + `${row.wouldBreak ? `BREAK(${row.wouldBreakBy})` : ''}`,
     )
   }

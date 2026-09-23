@@ -29,7 +29,7 @@ import { fileURLToPath } from 'node:url'
 import { join, dirname } from 'node:path'
 import { markAgentLoopRequest } from '@deepseek-ai/dsh-llm'
 import * as plugin from '../lib/index.js'
-import { ReasoningLoopBreaker, trailingCycle } from '../lib/index.js'
+import { ReasoningLoopBreaker, trailingCycle, periodicTailSpan } from '../lib/index.js'
 
 /**
  * Real reasoning tails captured from the reproduction.
@@ -818,10 +818,116 @@ test('a bleed at the widest measured period is caught by the SHIPPED default', (
   )
 })
 
+/* -------------------------------------------------------------------------- */
+/* what the notice reports: repetition size, not call length                   */
+/* -------------------------------------------------------------------------- */
+
+test('`repeatedChars` reports the repetition, not the call length', () => {
+  // The defect this pins: `emittedChars` is the call's TOTAL length, and the
+  // notice used to print it as "had repeated itself for N characters". On
+  // measured firings the two differ by 1.6x-10.1x (median 1.9x), so the model was
+  // told it had gone in circles far longer than it had.
+  //
+  // Shape: a long non-repeating preamble, then a short verbatim cycle. The
+  // preamble must NOT be counted as repetition.
+  const preamble = Array.from({ length: 60 }, (_, i) => `Considering aspect ${i} of the design in detail.`).join('\n')
+  const unit = 'Now. Writing. Go. OK. Let me write it.\n'
+  const text = `${preamble}\n${unit.repeat(40)}`
+
+  const breaker = new ReasoningLoopBreaker(CONFIG)
+  let tripped = false
+  for (let i = 0; i < text.length; i += 32) {
+    if (breaker.push(text.slice(i, i + 32))) { tripped = true; break }
+  }
+  assert.ok(tripped, 'the cycle must trip')
+
+  // The call's total is far larger than the repetition, and the repetition must
+  // be bounded by the cyclic tail rather than the whole call.
+  assert.ok(breaker.emittedChars > 3000, `the call emitted plenty, got ${breaker.emittedChars}`)
+  assert.ok(
+    breaker.repeatedChars < breaker.emittedChars / 2,
+    `repetition (${breaker.repeatedChars}) must be well below the call total (${breaker.emittedChars})`,
+  )
+  // And it must be at least the qualifying span, never zero.
+  assert.ok(breaker.repeatedChars >= CONFIG.minRepeatedReasoningCycleChars, 'a real span, not 0')
+})
+
+test('the reported repetition is a genuine periodic tail, maximal in length', () => {
+  // Property check rather than a magic number: the reported span must be periodic
+  // AND one character longer must NOT be, so it is the real extent of the
+  // repetition rather than an arbitrary prefix of it.
+  const unit = 'Executing. Go. Now. Writing. OK.\n'
+  const text = `${'x'.repeat(5000)}\n${unit.repeat(60)}`
+  const breaker = new ReasoningLoopBreaker(CONFIG)
+  for (let i = 0; i < text.length; i += 32) {
+    if (breaker.push(text.slice(i, i + 32))) break
+  }
+  const span = breaker.repeatedChars
+  const seen = text.slice(0, breaker.emittedChars)
+  assert.ok(span > 0, 'a span was reported')
+
+  // Periodic: brute-force search for ANY period that reproduces the tail.
+  const periodic = (s) => {
+    for (let p = 1; p <= Math.min(512, Math.floor(s.length / 2)); p++) {
+      if (new Set(s.slice(s.length - p)).size < 2) continue
+      let ok = true
+      for (let i = s.length - 1; i >= p; i--) if (s[i] !== s[i - p]) { ok = false; break }
+      if (ok) return true
+    }
+    return false
+  }
+  assert.ok(periodic(seen.slice(-span)), 'the reported span must be periodic')
+  if (span + 1 <= seen.length) {
+    assert.ok(!periodic(seen.slice(-(span + 1))), 'one more character must break the periodicity')
+  }
+})
+
+test('`trailingCycle` stays capped while `periodicTailSpan` reports the true extent', () => {
+  // The two must not be confused: `trailingCycle` is the DECISION rule and stops
+  // at `max(minSpan, 2 * period)` on purpose, so its value is a lower bound. Only
+  // `periodicTailSpan` walks the tail out, and it is what the notice uses.
+  const unit = 'Go. OK. Now.\n'
+  const text = unit.repeat(400)          // a long, genuine cycle
+  const capped = trailingCycle(text, 512, 512)
+  const full = periodicTailSpan(text, 512, 512)
+  assert.ok(capped > 0, 'the cycle rule sees it')
+  assert.ok(full > capped, `the true span (${full}) must exceed the capped one (${capped})`)
+  assert.ok(full >= text.length - unit.length * 2, `the span should cover nearly the whole text, got ${full}`)
+})
+
+test('`periodicTailSpan` returns 0 on text with no period', () => {
+  let seed = 7
+  const rnd = () => (seed = (seed * 1103515245 + 12345) >>> 0) / 4294967296
+  const noise = Array.from({ length: 4000 }, () => String.fromCharCode(97 + Math.floor(rnd() * 26))).join('')
+  assert.equal(periodicTailSpan(noise, 512, 512), 0)
+  assert.equal(periodicTailSpan('short', 512, 512), 0)
+  assert.equal(periodicTailSpan(noise, 0, 512), 0, 'a disabled cap reports nothing')
+})
+
+test('the notice carries the repetition figure, not the call length', async () => {
+  // End-to-end through `apply()`: the steered text must contain the repetition
+  // size. Asserting the property (the number is the repeated one) rather than a
+  // literal, so a retune does not break it.
+  const unit = 'Now. Writing. Go. OK.\n'
+  const text = `${'y'.repeat(6000)}\n${unit.repeat(60)}`
+  const { stream, steered } = host()
+  const out = await drive(stream, reasoningChunks(text))
+  assert.ok(out.some((c) => c.type === 'finish'), 'the call was ended')
+
+  const notice = steered.find((m) => m.source?.kind === 'plugin')
+  assert.ok(notice, 'a correction was steered')
+  const body = notice.content.map((b) => b.text).join('')
+  const number = Number((body.match(/(\d+)/) ?? [])[1])
+  assert.ok(Number.isFinite(number) && number > 0, `the notice must carry a figure, got: ${body}`)
+  // The load-bearing assertion: the figure is far below the call's length. The
+  // old code printed `emittedChars` here, which for this shape is the whole text.
+  assert.ok(
+    number < text.length / 2,
+    `the notice reported ${number} for a ${text.length}-character call; it must report the repetition`,
+  )
+})
+
 test('a synthetic 409-character period trips the shipped default', () => {
-  // The fixture cannot carry the 409-period sample (it was captured from a
-  // different session), so the shape is rebuilt here: a period that is longer
-  // than the old 256 cap and would have been invisible to it.
   const period = 409
   let unit = ''
   for (let i = 0; unit.length < period; i++) unit += `Step ${i} revisits the parser at offset ${i * 31}.\n\n`

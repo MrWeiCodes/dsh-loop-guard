@@ -382,6 +382,18 @@ You only need `resumeAfterBreak: true` if you want it to continue *without waiti
 
 Two traces: a "context injected" notice in the UI (`dsh-loop-guard · 已截断重复的思考内容（N 字符）`) and a warn line in the host log. **The turn-end reason does not show it** — it is `completed`, identical to a normal finish. That is deliberate: the point of a break is to keep the session usable, not to raise an alarm.
 
+**Q: How is the "repeated itself for N characters" figure computed?**
+
+N is the **repetition size** — how much of the call was actually repetition (fixed in 1.0.3):
+
+| Rule that fired | What N measures |
+| --- | --- |
+| `reasoning-cycle` / `repeating-cycle` | the length of the periodic tail |
+| `reasoning-lines` | the characters sitting in lines seen more than once |
+| `identical-chunks` | the trailing identical run, times the payload length |
+
+It is **not** the call's total length. An earlier version reported the total, which overstated the repetition by **1.6x-10.1x** (median 1.9x) across 17 measured firings — the worst case claimed "5,792 characters repeated" when only 575 had.
+
 **Q: Will it cut legitimate long reasoning?**
 
 No. The judgement is **verbatim periodicity** and **cross-call restatement**, not duration and not a ratio. Measured, zero false positives across 997 productive real calls; generated tables, logs, CSS and JSON are not flagged either. The visible-output cycle rule was calibrated over **2,973 real long texts** (≥1500 chars, across several workspaces) at period caps from 64 through 4096, with **zero** false positives.
