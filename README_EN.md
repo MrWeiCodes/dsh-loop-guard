@@ -31,6 +31,23 @@ This plugin wraps the `llm/stream` waterfall, judges each model call by its chun
 
 The screenshot above is real output: the reasoning block cycles through `OK. / Writing. / Let me write. / Go. / Executing. / Now.`, the plugin cuts that call once the repetition crosses its threshold, and a notice is injected below to point the model back at its task.
 
+### The chat pane no longer shows the notice from 0.1.7
+
+DSH **0.1.7** excluded context-kind messages from the chat pane's visible rows (`isVisibleChatNode`, which hard-codes `kind !== "context"`), so the injected correction is **not rendered at all** there — it is not collapsed, it is simply absent.
+
+0.1.6 and earlier have no such filter; the notice showed as a "Context injection" row.
+
+Nothing is lost; it is readable in two places:
+
+| Where | What you see |
+| --- | --- |
+| **Session history / trajectory view** | the message listed verbatim, labelled **CONTEXT**, with the full body |
+| **Host log** | `dsh-loop-guard: breaking a repetitive stream (N repeated chars, ...)` |
+
+In the trajectory view (the `CONTEXT` row):
+
+![The cut notice in the trajectory view](assets/notice-in-trajectory.png)
+
 ## Features
 
 - **Four detectors, one per shape**: reasoning-only calls, restated-material calls, a **periodic cycle inside reasoning**, and a **phrase-pool reshuffle inside reasoning**. The last two are complementary; see below.
@@ -380,7 +397,7 @@ You only need `resumeAfterBreak: true` if you want it to continue *without waiti
 
 **Q: How do I tell that a cut happened?**
 
-Two traces: a "context injected" notice in the UI (`dsh-loop-guard · 已截断重复的思考内容（N 字符）`) and a warn line in the host log. **The turn-end reason does not show it** — it is `completed`, identical to a normal finish. That is deliberate: the point of a break is to keep the session usable, not to raise an alarm.
+Two traces: the injected correction (from 0.1.7 the chat pane no longer renders it — read the body in the **trajectory view**, see above) and a warn line in the host log. **The turn-end reason does not show it** — it is `completed`, identical to a normal finish. That is deliberate: the point of a break is to keep the session usable, not to raise an alarm.
 
 **Q: How is the "repeated itself for N characters" figure computed?**
 
