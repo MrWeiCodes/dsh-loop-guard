@@ -3,7 +3,7 @@
   "quotes": [
     {
       "id": "wb-identity-plan",
-      "source": "session-bcf905ec-c8f0-4063-b754-13ee129dd247 @1443 (dsh-workbuddy-connect, turn 24 step 16)",
+      "source": "session-00000000-0000-0000-0000-000000000000 @1443 (dsh-workbuddy-connect, turn 24 step 16)",
       "why": "A planning call that quotes chatStream and probeEffort before and after the edit. It was CUT for real, at character 3712 of 3713 - the cut saved nothing and cost the turn a step.",
       "reasoningChars": 3713,
       "cutAtChars": 3712,
