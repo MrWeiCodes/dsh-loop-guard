@@ -40,7 +40,7 @@
  * is pointed at to answer whether the shipped plugin would have cut it.
  */
 import { readFileSync } from 'node:fs'
-import { LoopDetector, countRepeatedText, trailingCycle, periodicTailSpan } from '../lib/index.js'
+import { LoopDetector, TextRepetitionDetector, countRepeatedText, trailingCycle } from '../lib/index.js'
 
 const DEFAULT_CONFIG = {
   maxThinkingSteps: 3,
@@ -55,6 +55,9 @@ const DEFAULT_CONFIG = {
   maxRepeatedReasoningLineChars: 2048,
   minRepeatedReasoningLineCoverage: 0.6,
   minRepeatedReasoningLineConcentration: 4,
+  maxRepeatedTextLineChars: 2048,
+  minRepeatedTextLineCoverage: 0.6,
+  minRepeatedTextLineConcentration: 4,
 }
 
 function parseArgs(argv) {
@@ -190,20 +193,19 @@ for (const [index, step] of steps.entries()) {
   const reason = detector.observe({ hasOutput: step.hasOutput, reasoning: step.reasoning })
   const fire = detector.takeFire()
   const repeatRun = countRepeatedText(step.texts)
-  // Both rules run on the SAME input the plugin's breaker sees: text deltas
+  // Every rule runs on the SAME input the plugin's breaker sees: text deltas
   // only, in stream order. This tool exists to answer "would the shipped breaker
   // have cut this call?", so a rule the plugin has but the tool does not would
-  // make the tool quietly wrong.
+  // make the tool quietly wrong. That is why the decision comes from the real
+  // `TextRepetitionDetector` rather than from a re-implementation: a hand-rolled
+  // copy silently missed the phrase-pool rule the moment it was added.
+  const breaker = new TextRepetitionDetector(config)
+  let brokeAt = 0
+  for (const chunk of step.texts) {
+    if (breaker.push(chunk)) { brokeAt = breaker.emittedChars; break }
+  }
+  const wouldBreakBy = brokeAt > 0 ? (breaker.trippedBy ?? null) : null
   const cycleSpan = trailingCycle(step.texts.join(''), config.maxRepeatedCycleChars, config.minRepeatedCycleChars)
-  const byChunks = config.maxRepeatedText > 0 && repeatRun >= config.maxRepeatedText
-  const byCycle = cycleSpan > 0
-  const wouldBreakBy = byChunks ? 'identical-chunks' : (byCycle ? 'repeating-cycle' : null)
-  // The figure the notice would print. `cycleSpan` above is the DECISION rule's
-  // capped lower bound; the notice reports the true extent of the repetition, so
-  // the tool has to report the same number or it misrepresents the plugin.
-  const repeatedChars = byChunks
-    ? repeatRun * (step.texts.at(-1)?.length ?? 0)
-    : (byCycle ? periodicTailSpan(step.texts.join(''), config.maxRepeatedCycleChars, config.minRepeatedCycleChars) : 0)
   report.push({
     step: index + 1,
     turn: step.turn,
@@ -219,7 +221,10 @@ for (const [index, step] of steps.entries()) {
     // breaker would have ended this call mid-stream.
     repeatedRun: repeatRun,
     cycleSpan,
-    repeatedChars,
+    brokeAt,
+    // The figure the notice would print — taken from the breaker itself so the
+    // tool cannot misreport it.
+    repeatedChars: breaker.repeatedChars,
     wouldBreak: wouldBreakBy !== null,
     wouldBreakBy,
   })

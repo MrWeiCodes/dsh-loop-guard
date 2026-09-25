@@ -191,15 +191,29 @@ test('analyzer flags a single call that repeats one sentence to the end', () => 
   assert.equal(steps[0].textChunks, 300)
 })
 
-test('analyzer counts only the TRAILING run, so an early repeat is not a break', () => {
+test('the analyzer matches the streaming plugin: an early run IS cut, before the tail changes', () => {
+  // This assertion used to read `wouldBreak === false`, and that was WRONG — it
+  // described a post-hoc reading of the whole text rather than what the plugin
+  // does. The plugin decides *while the stream is open*: on the third `header`
+  // the run reaches the threshold and the call is cut there. It cannot know that
+  // the fourth chunk will differ, because that chunk has not arrived yet.
+  //
+  // So the analyzer now feeds the real `TextRepetitionDetector` chunk by chunk,
+  // and the verdict is "cut" — which is what the plugin actually does. The old
+  // assertion certified a divergence between the tool and the plugin it exists
+  // to model.
   const file = writeSession([
     { type: 'assistant/attempt', seq: 0, time: 0, data: { turn: 0, step: 0, stream: [
       { type: 'text-chunks', time0: 0, texts: [[0, 'header'], [1, 'header'], [2, 'header'], [3, 'then real work continued here']] },
     ] } },
   ])
   const { steps } = run(file, ['--max-repeated-text', '3'])
+  // `repeatedRun` still reports the trailing run of the WHOLE call, which is 1 —
+  // it is a descriptive statistic, not the verdict.
   assert.equal(steps[0].repeatedRun, 1)
-  assert.equal(steps[0].wouldBreak, false)
+  assert.equal(steps[0].wouldBreak, true, 'the plugin cuts on the third identical chunk')
+  assert.equal(steps[0].wouldBreakBy, 'identical-chunks')
+  assert.equal(steps[0].brokeAt, 18, 'three 6-character chunks')
 })
 
 test('analyzer leaves a healthy multi-chunk call alone', () => {

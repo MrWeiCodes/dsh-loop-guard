@@ -50,7 +50,7 @@ In the trajectory view (the `CONTEXT` row):
 
 ## Features
 
-- **Four detectors, one per shape**: reasoning-only calls, restated-material calls, a **periodic cycle inside reasoning**, and a **phrase-pool reshuffle inside reasoning**. The last two are complementary; see below.
+- **Five detectors, one per shape**: reasoning-only calls, restated-material calls, a **periodic cycle inside visible output**, a **phrase-pool reshuffle inside visible output**, and a **phrase-pool reshuffle inside reasoning**. The last three are complementary; see below.
 - **It can end a turn that would never end**: this is the plugin's core reason to exist. In a degenerate loop the stream never finishes, so any "judge it after the call ends" detector is structurally out of reach; only a cut from inside the stream works.
 - **The task carries on — no manual restart**: a cut ends the current call only. The turn settles normally and the session stays usable, so the work in progress simply continues. That is the difference from "stuck until the user aborts".
 - **It cuts at ~1%**: measured, a **330,188**-character loop is cut at **3,264 characters** (1.0 %), and a 124,070-character one at 17,888 (14.4 %). Previously both ran to completion and needed a manual abort.
@@ -242,6 +242,12 @@ interface Config {
   minRepeatedReasoningLineCoverage?: number
   /** How concentrated the line vocabulary must be: average sightings per distinct line. Default 4. */
   minRepeatedReasoningLineConcentration?: number
+  /** Repeated-LINE characters in the **visible output** that end the stream — the text-side mirror of the reasoning rule. 0 disables. Default 2048. */
+  maxRepeatedTextLineChars?: number
+  /** Share of counted visible-output characters that must sit in repeated lines. Default 0.6. */
+  minRepeatedTextLineCoverage?: number
+  /** Average sightings per distinct line required of the visible output. Default 4. */
+  minRepeatedTextLineConcentration?: number
 
   // ── behaviour after a cut ─────────────────────────────────
   /** Error code on a mid-stream break. Default 'REPETITIVE_OUTPUT'. */
@@ -350,8 +356,31 @@ The two rules are **complementary**, not redundant:
 
 | Bleed shape | Rule that catches it |
 |---|---|
-| Short verbatim period (`Go.` / `OK.`, shorter than 2 chars are not counted) | `reasoning-cycle` |
-| Long-phrase pool, reshuffled | `reasoning-lines` |
+| Visible output: short verbatim period (`Go.` / `OK.`) | `repeating-cycle` |
+| Visible output: phrase pool, reshuffled | `text-lines` |
+| Reasoning: short verbatim period | `reasoning-cycle` |
+| Reasoning: phrase pool, reshuffled | `reasoning-lines` |
+
+### Why visible output needed its own rule (v1.0.5)
+
+The two visible-output rules that predate it are **structurally** out of reach, not merely short of a threshold:
+
+| Rule | Why it cannot reach this shape |
+| --- | --- |
+| `maxRepeatedText` | It counts **consecutive identical deltas**. Providers chunk text into **2-3 character** fragments, so `Go.` arrives as `Go` + `.` — over a real 56 465-character call the longest run of identical payloads was **1**, against a threshold of 60. No amount of extra length reaches it. |
+| `maxRepeatedCycleChars` | It needs an exact period, and a reshuffled pool has none: `trailingCycle(512, 256)` returned **0**. |
+
+The reasoning side already had `reasoning-lines`, which is why **69 of the 72** breaks in that session were reasoning-side. Once the loop moved entirely into visible output (that call had zero reasoning and zero tool calls) it fell into the gap and ran to 56 465 characters until the user aborted the turn.
+
+Measured on that call: 26 distinct phrases across 5 569 sightings, repeat mass **44 995** characters (22x the threshold), coverage **0.993**, concentration **214**.
+
+The fix mirrors the reasoning-side rule onto the text side; both share one accumulator implementation so their thresholds cannot drift apart.
+
+| Item | Result |
+| --- | --- |
+| That 56 465-character loop | cut at **2 944 characters (5.2 %)** — **53 521** characters early |
+| Full-store scan (400 sessions) | **2** firings, **0** false positives (the other is the 44 387-character bleed already documented above) |
+| Legitimate long texts | this repo's READMEs and source, plus permgate's `index.js` (232 KB) and `client.js` (265 KB): none trip |
 
 Calibration, on the same real session (146 reasoning calls: 17 aborted bleeds, 119 producing calls):
 

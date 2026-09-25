@@ -370,6 +370,43 @@ export interface Config {
    */
   minRepeatedReasoningLineConcentration?: number
   /**
+   * Repeated-LINE characters in the call's **visible output** that end the stream
+   * — the phrase-pool rule for text, mirroring
+   * {@link Config.maxRepeatedReasoningLineChars}. `0` disables it. Default `2048`.
+   *
+   * ## Why the visible-output side needs its own phrase-pool rule
+   *
+   * The two visible-output rules that predate this one cannot see a reshuffled
+   * phrase pool, and on a real 56 465-character bleed **both missed it by
+   * construction, not by a margin**:
+   *
+   *  - `maxRepeatedText` counts *consecutive identical deltas*. Providers chunk
+   *    text into 2-3 character fragments, so `Go.` arrives as `Go` + `.` and the
+   *    longest run of identical payloads over the whole bleed was **1**, against a
+   *    threshold of 60. It cannot fire at any length.
+   *  - `maxRepeatedCycleChars` needs an exact period, and a reshuffled pool has
+   *    none: `trailingCycle(512, 256)` returned **0**.
+   *
+   * That bleed was one call with zero reasoning and zero tool calls, so the
+   * reasoning-side rule ({@link Config.maxRepeatedReasoningLineChars}) could not
+   * reach it either — the loop ran entirely in visible output. Measured on it: 26
+   * distinct phrases across 5 569 sightings, repeat mass **44 995** characters
+   * (22x this threshold), coverage **0.993**, concentration **214**.
+   */
+  maxRepeatedTextLineChars?: number
+  /**
+   * Share of counted visible-output characters that must sit in repeated lines
+   * before the phrase-pool rule fires. Default `0.6`, matching the reasoning side.
+   */
+  minRepeatedTextLineCoverage?: number
+  /**
+   * Average sightings per distinct line required of the visible output. Default
+   * `4`, matching the reasoning side — see
+   * {@link Config.minRepeatedReasoningLineConcentration} for why coverage alone is
+   * not enough.
+   */
+  minRepeatedTextLineConcentration?: number
+  /**
    * Error code carried by the breaker's terminal failure. Default
    * `'REPETITIVE_OUTPUT'`.
    *
@@ -429,6 +466,9 @@ export const Config: z<Config> = z.object({
   maxRepeatedReasoningLineChars: z.number().step(1).min(0).default(2048),
   minRepeatedReasoningLineCoverage: z.number().min(0).max(1).default(0.6),
   minRepeatedReasoningLineConcentration: z.number().min(0).default(4),
+  maxRepeatedTextLineChars: z.number().step(1).min(0).default(2048),
+  minRepeatedTextLineCoverage: z.number().min(0).max(1).default(0.6),
+  minRepeatedTextLineConcentration: z.number().min(0).default(4),
   breakCode: z.string().default('REPETITIVE_OUTPUT'),
   breakCorrection: z.boolean().default(true),
   resumeAfterBreak: z.boolean().default(false),
@@ -526,7 +566,99 @@ const LINE_MIN_CHARS = 2
  * `reasoning-cycle` and `reasoning-lines` watch reasoning under the two
  * complementary rules described on {@link ReasoningLoopBreaker}.
  */
-export type BreakRule = 'identical-chunks' | 'repeating-cycle' | 'reasoning-cycle' | 'reasoning-lines'
+export type BreakRule = 'identical-chunks' | 'repeating-cycle' | 'reasoning-cycle' | 'reasoning-lines' | 'text-lines'
+
+/**
+ * The phrase-pool accumulator shared by the reasoning and visible-output rules.
+ *
+ * Both sides need the same measure: how much of the text sits in lines that have
+ * been seen more than once, and how concentrated that vocabulary is. Keeping one
+ * implementation means a threshold change cannot make the two sides disagree.
+ *
+ * ## Why the visible-output side needs it at all
+ *
+ * A bleed can reshuffle a small phrase pool instead of repeating one period, and
+ * that shape is invisible to both visible-output rules that predate this:
+ *
+ *  - `identical-chunks` counts *consecutive identical deltas*. Providers chunk
+ *    text into 2-3 character fragments, so `Go.` arrives as `Go` + `.` and the
+ *    longest run of identical payloads on a real 56 465-character bleed was
+ *    **1** — the rule cannot reach 60 at any length.
+ *  - `repeating-cycle` needs an exact period. A reshuffled pool has none: on that
+ *    same bleed `trailingCycle(512, 256)` returned **0**.
+ *
+ * Measured on that bleed (one call, zero reasoning, zero tool calls): 26 distinct
+ * phrases across 5 569 sightings, repeat mass **44 995** characters, coverage
+ * **0.993**, concentration **214**. Every threshold here is cleared by an order of
+ * magnitude, so the rule fires early rather than at the end.
+ *
+ * Incremental: each complete line is folded in exactly once, so the cost stays
+ * linear in emitted characters.
+ */
+class PhrasePool {
+  /** How many times each counted line has been seen. */
+  private readonly counts = new Map<string, number>()
+  /** Characters sitting in counted lines. */
+  private total = 0
+  /** Characters sitting in lines that have been seen more than once. */
+  private repeat = 0
+  /** Total sightings of counted lines (the denominator of the concentration). */
+  private instances = 0
+  /** Trailing text not yet terminated by a newline. */
+  private partial = ''
+
+  /** The repeated mass so far, for the break report. */
+  get repeatedChars(): number {
+    return this.repeat
+  }
+
+  /** Fold one delta in, counting only the lines it completes. */
+  push(text: string): void {
+    this.partial += text
+    let idx: number
+    while ((idx = this.partial.indexOf('\n')) >= 0) {
+      this.addLine(this.partial.slice(0, idx).trim())
+      this.partial = this.partial.slice(idx + 1)
+    }
+  }
+
+  /**
+   * Whether the accumulated pool has crossed every threshold.
+   *
+   * @param minRepeat - characters that must sit in repeated lines.
+   * @param minCoverage - share of counted characters that must be repeated.
+   * @param minConcentration - average sightings per distinct line. Coverage alone
+   *   cannot tell a phrase pool from one long block quoted twice; see
+   *   {@link Config.minRepeatedReasoningLineConcentration}.
+   */
+  tripped(minRepeat: number, minCoverage: number, minConcentration: number): boolean {
+    if (this.repeat < minRepeat) return false
+    if (this.total === 0) return false
+    if (this.repeat / this.total < minCoverage) return false
+    if (this.counts.size === 0) return false
+    return this.instances / this.counts.size >= minConcentration
+  }
+
+  /**
+   * Fold one complete line into the running counts.
+   *
+   * The repeat mass is maintained rather than recomputed: on the *second*
+   * sighting of a line both copies become repetition, hence `* 2`, and every
+   * sighting after that adds one more copy. Lines below {@link LINE_MIN_CHARS}
+   * are dropped entirely so they never enter the denominator either.
+   *
+   * @param line - the trimmed line.
+   */
+  private addLine(line: string): void {
+    if (line.length < LINE_MIN_CHARS) return
+    const prev = this.counts.get(line) ?? 0
+    this.counts.set(line, prev + 1)
+    this.total += line.length
+    this.instances += 1
+    if (prev === 1) this.repeat += line.length * 2
+    else if (prev > 1) this.repeat += line.length
+  }
+}
 
 /**
  * The distinct fixed-length grams of one reasoning text.
@@ -913,16 +1045,8 @@ export class ReasoningLoopBreaker {
   private reasoning = ''
   private lastCycleCheck = 0
   private trippedRule: 'reasoning-cycle' | 'reasoning-lines' | undefined
-  /** Trailing text not yet terminated by a newline. */
-  private linePartial = ''
-  /** How many times each counted line has been seen. */
-  private lineCounts = new Map<string, number>()
-  /** Characters sitting in counted lines. */
-  private lineTotal = 0
-  /** Characters sitting in lines that have been seen more than once. */
-  private lineRepeat = 0
-  /** Total sightings of counted lines (the denominator of the concentration). */
-  private lineInstances = 0
+  /** The phrase-pool accumulator for the `reasoning-lines` rule. */
+  private readonly pool = new PhrasePool()
   /** Repetition size recorded by whichever rule tripped. */
   private repeated = 0
 
@@ -980,7 +1104,7 @@ export class ReasoningLoopBreaker {
       // The line rule's own measure of how much repeated: the mass sitting in
       // lines seen more than once. Reporting `chars` here instead would claim the
       // call's entire length was repetition.
-      this.repeated = this.lineRepeat
+      this.repeated = this.pool.repeatedChars
       return true
     }
     if (this.config.maxRepeatedReasoningCycleChars <= 0) return false
@@ -1050,39 +1174,12 @@ export class ReasoningLoopBreaker {
    */
   private pushLines(text: string): boolean {
     if (this.config.maxRepeatedReasoningLineChars <= 0) return false
-    this.linePartial += text
-    let idx: number
-    while ((idx = this.linePartial.indexOf('\n')) >= 0) {
-      this.addLine(this.linePartial.slice(0, idx).trim())
-      this.linePartial = this.linePartial.slice(idx + 1)
-    }
-    if (this.lineRepeat < this.config.maxRepeatedReasoningLineChars) return false
-    if (this.lineTotal === 0) return false
-    if (this.lineRepeat / this.lineTotal < this.config.minRepeatedReasoningLineCoverage) return false
-    // The concentration guard: coverage alone cannot tell a phrase pool from one
-    // long code block quoted twice. See the config field for the measurement.
-    if (this.lineCounts.size === 0) return false
-    return this.lineInstances / this.lineCounts.size >= this.config.minRepeatedReasoningLineConcentration
-  }
-
-  /**
-   * Fold one complete line into the running counts.
-   *
-   * The repeat mass is maintained rather than recomputed: on the *second*
-   * sighting of a line both copies become repetition, hence `* 2`, and every
-   * sighting after that adds one more copy. Lines below {@link LINE_MIN_CHARS}
-   * are dropped entirely so they never enter the denominator either.
-   *
-   * @param line - the trimmed line.
-   */
-  private addLine(line: string): void {
-    if (line.length < LINE_MIN_CHARS) return
-    const prev = this.lineCounts.get(line) ?? 0
-    this.lineCounts.set(line, prev + 1)
-    this.lineTotal += line.length
-    this.lineInstances += 1
-    if (prev === 1) this.lineRepeat += line.length * 2
-    else if (prev > 1) this.lineRepeat += line.length
+    this.pool.push(text)
+    return this.pool.tripped(
+      this.config.maxRepeatedReasoningLineChars,
+      this.config.minRepeatedReasoningLineCoverage,
+      this.config.minRepeatedReasoningLineConcentration,
+    )
   }
 }
 
@@ -1103,9 +1200,11 @@ export class TextRepetitionDetector {
   private broken = false
   private visible = ''
   private lastCycleCheck = 0
-  private reason: 'identical-chunks' | 'repeating-cycle' | undefined
+  private reason: 'identical-chunks' | 'repeating-cycle' | 'text-lines' | undefined
   /** Repetition size recorded by whichever rule tripped. */
   private repeated = 0
+  /** The phrase-pool accumulator for the `text-lines` rule. */
+  private readonly pool = new PhrasePool()
 
   /**
    * @param config - the resolved plugin configuration.
@@ -1118,7 +1217,7 @@ export class TextRepetitionDetector {
   }
 
   /** Which rule fired, for the log line and for tests. */
-  get trippedBy(): 'identical-chunks' | 'repeating-cycle' | undefined {
+  get trippedBy(): 'identical-chunks' | 'repeating-cycle' | 'text-lines' | undefined {
     return this.reason
   }
 
@@ -1156,7 +1255,8 @@ export class TextRepetitionDetector {
   push(text: string): boolean {
     if (this.broken) return false
     this.chars += text.length
-    if (this.config.maxRepeatedText <= 0 && this.config.maxRepeatedCycleChars <= 0) return false
+    if (this.config.maxRepeatedText <= 0 && this.config.maxRepeatedCycleChars <= 0
+      && this.config.maxRepeatedTextLineChars <= 0) return false
     this.texts.push(text)
     if (this.config.maxRepeatedText > 0
       && this.texts.length >= this.config.maxRepeatedText
@@ -1167,6 +1267,22 @@ export class TextRepetitionDetector {
       // length so the figure is comparable with the cycle rule's span.
       this.repeated = countRepeatedText(this.texts) * text.length
       return true
+    }
+    // The phrase-pool rule. Fed before the cycle scan and independent of it: a
+    // reshuffled pool has no period at all, so the two rules cannot substitute
+    // for each other. See {@link PhrasePool} for the measurement.
+    if (this.config.maxRepeatedTextLineChars > 0) {
+      this.pool.push(text)
+      if (this.pool.tripped(
+        this.config.maxRepeatedTextLineChars,
+        this.config.minRepeatedTextLineCoverage,
+        this.config.minRepeatedTextLineConcentration,
+      )) {
+        this.broken = true
+        this.reason = 'text-lines'
+        this.repeated = this.pool.repeatedChars
+        return true
+      }
     }
     if (this.config.maxRepeatedCycleChars <= 0) return false
     this.visible += text
@@ -1296,8 +1412,9 @@ function stringsFor(lang: 'zh' | 'en'): Strings {
 
 /** The noun naming what repeated, in the language the model is addressed in. */
 function whatFor(lang: 'zh' | 'en', rule: BreakRule): string {
-  if (lang === 'zh') return rule === 'identical-chunks' || rule === 'repeating-cycle' ? '可见输出' : '思考内容'
-  return rule === 'identical-chunks' || rule === 'repeating-cycle' ? 'visible output' : 'reasoning'
+  const visible = rule === 'identical-chunks' || rule === 'repeating-cycle' || rule === 'text-lines'
+  if (lang === 'zh') return visible ? '可见输出' : '思考内容'
+  return visible ? 'visible output' : 'reasoning'
 }
 
 /**
