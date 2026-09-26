@@ -121,36 +121,53 @@ It is off by default because it re-enters the model without being asked, on a fa
 
 > **Note**: this plugin needs DSH's `llm/stream` waterfall, which is present on every published line from **0.1.2-rc.1** onward.
 
+> **⚠️ The package name is `@mrweicodes/dsh-loop-guard`**
+>
+> There is also an **unscoped** package of the same name on npm, **`dsh-loop-guard`**.
+> It is **unrelated to this plugin** — not a release of this project and not
+> maintained by it. This plugin is published only under the
+> **`@mrweicodes/dsh-loop-guard`** scope.
+>
+> **Check the full package name before installing** — do not install the unscoped
+> package of the same name.
+
 ### Option 1: Let the AI install it (simplest)
 
 Just give the repository URL to DSH's AI assistant, e.g. "install the plugin at https://github.com/MrWeiCodes/dsh-loop-guard". The AI handles the plugin loading, dependencies and patch; then restart `dsh web`.
 
-### Option 2: Install from GitHub
+### Option 2: Install from npm (recommended)
+
+```powershell
+dsh plugin --profile web add @mrweicodes/dsh-loop-guard
+```
+
+**Why this is the recommended path**: the npm tarball already contains the compiled `lib/`, so the install runs no build script at all — it is unaffected by pnpm's build-script approval and does not depend on a local compiler. Then restart `dsh web`.
+
+### Option 3: Install from GitHub
 
 ```powershell
 dsh plugin --profile web add -w github:MrWeiCodes/dsh-loop-guard
 ```
 
-This installs the source, so `lib/` must be built locally — you **may need to allow the build script in the profile's `pnpm-workspace.yaml`** (pnpm 10 blocks dependency build scripts by default; paste the line it prints and re-run).
+This installs the source, so `lib/` is compiled on the spot by the `prepare` script — you **may need to allow the build script in the profile's `pnpm-workspace.yaml`** (pnpm 10 blocks dependency build scripts by default; paste the line it prints and re-run). **If you would rather not deal with that, use Option 2** — the npm tarball already carries the build output.
 
-> **Known issue installing from a local directory**: on Windows, if the plugin directory and the profile are on **different drives** (plugin on `G:\`, profile on `C:\`), pnpm misresolves the `file:` dependency to `C:\Users\<name>\...` and the install fails. Use Option 3 instead.
+> **Known issue installing from a local directory**: on Windows, if the plugin directory and the profile are on **different drives** (plugin on `G:\`, profile on `C:\`), pnpm misresolves the `file:` dependency to `C:\Users\<name>\...` and the install fails. Use Option 4 instead.
 
-### Option 3: Manual install
+### Option 4: Manual install
 
 The fallback when pnpm is unavailable or you are offline:
 
-1. Clone the repository into the profile's plugin directory and build once:
+1. Clone the repository into the profile's plugin directory and build once (the `prepare` script produces `lib/`):
    ```powershell
    # example: the web profile
    $dst = "$HOME\.dsh\profiles\web\packages\dsh-loop-guard"
    git clone https://github.com/MrWeiCodes/dsh-loop-guard.git $dst
    cd $dst
-   npm install      # also builds lib/
-   npm run build    # if the previous step did not produce lib/
+   npm install      # also triggers prepare -> builds lib/
    ```
 2. Add it to the profile's `package.json` `dependencies`:
    ```json
-   "dsh-loop-guard": "file:./packages/dsh-loop-guard"
+   "@mrweicodes/dsh-loop-guard": "file:./packages/dsh-loop-guard"
    ```
 3. Append the contents of `cordis.patch.yml` to the profile's `cordis.patch.yml`.
 4. Reinstall and restart: `pnpm install` (or `npm install`), then `dsh web`.
@@ -158,22 +175,26 @@ The fallback when pnpm is unavailable or you are offline:
 ## Updating
 
 - **Option 1 (AI install)**: just tell the AI "update the dsh-loop-guard plugin".
-- **Option 2 (GitHub)**: 
+- **Option 2 (npm)**:
+  ```powershell
+  dsh plugin --profile web add @mrweicodes/dsh-loop-guard@latest
+  ```
+  Then restart `dsh web`. The npm path involves no build step either.
+- **Option 3 (GitHub)**:
   ```powershell
   dsh plugin --profile web add -w github:MrWeiCodes/dsh-loop-guard
   ```
   If the latest commit is not picked up (git dependencies are cached), remove and re-add:
   ```powershell
-  dsh plugin --profile web remove dsh-loop-guard
+  dsh plugin --profile web remove @mrweicodes/dsh-loop-guard
   dsh plugin --profile web add -w github:MrWeiCodes/dsh-loop-guard
   ```
-  Then restart `dsh web`. **The commit hash changes after an update**; if pnpm asks for build approval again, redo the step from Option 2.
-- **Option 3 (manual)**:
+  Then restart `dsh web`. **The commit hash changes after an update**; if pnpm asks for build approval again, redo the step from Option 3.
+- **Option 4 (manual)**:
   ```powershell
   cd "$HOME\.dsh\profiles\web\packages\dsh-loop-guard"
   git pull            # or copy the new version over
-  npm install         # when dependency declarations changed
-  npm run build
+  npm install         # when dependency declarations changed; also triggers prepare
   ```
   Then restart `dsh web`.
 
@@ -183,24 +204,24 @@ The fallback when pnpm is unavailable or you are offline:
 
 Tell the AI assistant "uninstall the dsh-loop-guard plugin"; it removes the plugin and cleans up the patch and dependency.
 
-### Option 2 (GitHub)
+### Option 2 (npm) / Option 3 (GitHub)
 
 ```powershell
-dsh plugin --profile web remove dsh-loop-guard
+dsh plugin --profile web remove @mrweicodes/dsh-loop-guard
 ```
 
 Then restart `dsh web`.
 
-### Option 3 (manual)
+### Option 4 (manual)
 
 1. Remove this plugin's `insert` entry from the profile's `cordis.patch.yml`.
-2. Remove `"dsh-loop-guard": ...` from the profile's `package.json` `dependencies`.
+2. Remove `"@mrweicodes/dsh-loop-guard": ...` from the profile's `package.json` `dependencies`.
 3. Reinstall and restart: `pnpm install` (or `npm install`), then `dsh web`.
 
 ### Leftover locations (for an AI cleanup)
 
-- **Plugin directory** (Option 3 installs): `$DSH_HOME/profiles/<profile>/packages/dsh-loop-guard/`. `$DSH_HOME` defaults to `~/.dsh`.
-- **Dependency and patch** (Option 3 installs): the `"dsh-loop-guard": ...` dependency in the profile's `package.json`, and the `insert` entry in `cordis.patch.yml`.
+- **Plugin directory** (Option 4 installs): `$DSH_HOME/profiles/<profile>/packages/dsh-loop-guard/`. `$DSH_HOME` defaults to `~/.dsh`.
+- **Dependency and patch** (Option 4 installs): the `"@mrweicodes/dsh-loop-guard": ...` dependency in the profile's `package.json`, and the `insert` entry in `cordis.patch.yml`.
 - This plugin writes **no configuration file of its own** and has no global registry or system-level writes, so uninstalling leaves nothing behind.
 
 ## Configuration

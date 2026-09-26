@@ -13,4 +13,4 @@
 
 - insert:
     - id: loop-guard
-      name: 'dsh-loop-guard'
+      name: '@mrweicodes/dsh-loop-guard'

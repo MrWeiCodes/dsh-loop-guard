@@ -115,36 +115,51 @@ DSH **0.1.7** 把「上下文」类消息**从聊天区可见行里排除了**�
 
 > **说明**：本插件需要 DSH 的 `llm/stream` 瀑布流，DSH **0.1.2-rc.1 及以后**的各条线都可用。
 
+> **⚠️ 认准包名 `@mrweicodes/dsh-loop-guard`**
+>
+> npm 上还有一个**不带 scope** 的同名包 **`dsh-loop-guard`** —— 它**与本插件无关**，
+> 不是本项目的发布物，也不由本项目维护。本插件只发布在
+> **`@mrweicodes/dsh-loop-guard`** 这个 scope 下。
+>
+> **安装前请核对完整包名**，不要安装那个无 scope 的同名包。
+
 ### 方式一：让 AI 安装（最简单）
 
 把本仓库地址告诉 DSH 的 AI 助手即可，例如：「安装 https://github.com/MrWeiCodes/dsh-loop-guard 这个插件」。AI 会替你完成插件装载、依赖与补丁处理；之后重启 `dsh web`。
 
-### 方式二：从 GitHub 安装
+### 方式二：从 npm 安装（推荐）
+
+```powershell
+dsh plugin --profile web add @mrweicodes/dsh-loop-guard
+```
+
+**推荐这条路径的原因**：npm 包里已包含编译好的 `lib/`，安装时不执行任何构建脚本——不受 pnpm 构建授权限制的影响，也不依赖你本地的编译环境。之后重启 `dsh web`。
+
+### 方式三：从 GitHub 安装
 
 ```powershell
 dsh plugin --profile web add -w github:MrWeiCodes/dsh-loop-guard
 ```
 
-从 GitHub 装的是源码，`lib/` 需要现场编译，所以**装完可能需要在 profile 的 `pnpm-workspace.yaml` 里放行构建脚本**（pnpm 10 起默认阻止依赖执行构建脚本，按它打印的提示把那一行粘进去再重跑即可）。
+从 GitHub 装的是源码，`lib/` 由 `prepare` 脚本现场编译，所以**装完可能需要在 profile 的 `pnpm-workspace.yaml` 里放行构建脚本**（pnpm 10 起默认阻止依赖执行构建脚本，按它打印的提示把那一行粘进去再重跑即可）。**不想处理这一步就用「方式二」**——npm 包已包含编译产物，没有这个环节。
 
-> **从本地目录安装的已知问题**：Windows 上若插件目录与 profile **不在同一个盘符**（例如插件在 `G:\`、profile 在 `C:\`），pnpm 会把 `file:` 依赖错误解析成 `C:\Users\<用户名>\...` 而安装失败。此时请改用「方式三」。
+> **从本地目录安装的已知问题**：Windows 上若插件目录与 profile **不在同一个盘符**（例如插件在 `G:\`、profile 在 `C:\`），pnpm 会把 `file:` 依赖错误解析成 `C:\Users\<用户名>\...` 而安装失败。此时请改用「方式四」。
 
-### 方式三：手动安装
+### 方式四：手动安装
 
 无 pnpm 或离线环境时的备选路径：
 
-1. 把本仓库克隆到 profile 的插件目录，并在目标目录构建一次：
+1. 把本仓库克隆到 profile 的插件目录，并在目标目录构建一次（`prepare` 脚本会生成 `lib/`）：
    ```powershell
    # 示例：web profile
    $dst = "$HOME\.dsh\profiles\web\packages\dsh-loop-guard"
    git clone https://github.com/MrWeiCodes/dsh-loop-guard.git $dst
    cd $dst
-   npm install      # 同时编译出 lib/
-   npm run build    # 如上一步未生成 lib/，单独执行
+   npm install      # 同时触发 prepare → 生成 lib/
    ```
 2. 在 profile 的 `package.json` 的 `dependencies` 中加入：
    ```json
-   "dsh-loop-guard": "file:./packages/dsh-loop-guard"
+   "@mrweicodes/dsh-loop-guard": "file:./packages/dsh-loop-guard"
    ```
 3. 把 `cordis.patch.yml` 的内容并入 profile 的 `cordis.patch.yml`（在文件末尾追加）。
 4. 重新安装依赖并重启：`pnpm install`（或 `npm install`）、`dsh web`。
@@ -152,22 +167,26 @@ dsh plugin --profile web add -w github:MrWeiCodes/dsh-loop-guard
 ## 更新
 
 - **方式一（AI 安装）的**：直接告诉 AI「更新 dsh-loop-guard 插件」即可。
-- **方式二（GitHub 安装）的**：
+- **方式二（npm 安装）的**：
+  ```powershell
+  dsh plugin --profile web add @mrweicodes/dsh-loop-guard@latest
+  ```
+  然后重启 `dsh web`。npm 路径同样不涉及构建步骤。
+- **方式三（GitHub 安装）的**：
   ```powershell
   dsh plugin --profile web add -w github:MrWeiCodes/dsh-loop-guard
   ```
   若没有拉到最新提交（git 依赖有缓存），先移除再重新添加：
   ```powershell
-  dsh plugin --profile web remove dsh-loop-guard
+  dsh plugin --profile web remove @mrweicodes/dsh-loop-guard
   dsh plugin --profile web add -w github:MrWeiCodes/dsh-loop-guard
   ```
-  然后重启 `dsh web`。**更新到新提交后 commit 号会变**，若 pnpm 再次要求放行构建，按方式二的说明重做一次即可。
-- **方式三（手动）安装的**：
+  然后重启 `dsh web`。**更新到新提交后 commit 号会变**，若 pnpm 再次要求放行构建，按方式三的说明重做一次即可。
+- **方式四（手动）安装的**：
   ```powershell
   cd "$HOME\.dsh\profiles\web\packages\dsh-loop-guard"
   git pull            # 或重新拷贝新版本覆盖
-  npm install         # 依赖声明有变化时执行
-  npm run build
+  npm install         # 依赖声明有变化时执行；同时触发 prepare
   ```
   然后重启 `dsh web`。
 
@@ -177,24 +196,24 @@ dsh plugin --profile web add -w github:MrWeiCodes/dsh-loop-guard
 
 直接告诉 AI 助手「卸载 dsh-loop-guard 插件」，AI 会移除插件、清理补丁与依赖。
 
-### 方式二（GitHub）安装的
+### 方式二（npm）／方式三（GitHub）安装的
 
 ```powershell
-dsh plugin --profile web remove dsh-loop-guard
+dsh plugin --profile web remove @mrweicodes/dsh-loop-guard
 ```
 
 然后重启 `dsh web`。
 
-### 方式三（手动）安装的
+### 方式四（手动）安装的
 
 1. 从 profile 的 `cordis.patch.yml` 中删除本插件的 `insert` 行。
-2. 从 profile 的 `package.json` 的 `dependencies` 中删除 `"dsh-loop-guard": ...`。
+2. 从 profile 的 `package.json` 的 `dependencies` 中删除 `"@mrweicodes/dsh-loop-guard": ...`。
 3. 重新安装依赖并重启：`pnpm install`（或 `npm install`）、`dsh web`。
 
 ### 残留位置清单（AI 卸载时按此清理）
 
-- **插件目录**（方式三安装时）：`$DSH_HOME/profiles/<profile>/packages/dsh-loop-guard/`。`$DSH_HOME` 默认是 `~/.dsh`。
-- **依赖与补丁**（方式三安装时）：profile 的 `package.json` 中的 `"dsh-loop-guard": ...` 依赖、`cordis.patch.yml` 中的 `insert` 行。
+- **插件目录**（方式四安装时）：`$DSH_HOME/profiles/<profile>/packages/dsh-loop-guard/`。`$DSH_HOME` 默认是 `~/.dsh`。
+- **依赖与补丁**（方式四安装时）：profile 的 `package.json` 中的 `"@mrweicodes/dsh-loop-guard": ...` 依赖、`cordis.patch.yml` 中的 `insert` 行。
 - 本插件**不写任何自己的配置文件**，也没有全局注册表或系统级写入；卸载后不留配置残留。
 
 ## 配置
