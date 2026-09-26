@@ -1,6 +1,6 @@
 # dsh-loop-guard — Thinking-Loop Guard for DSH
 
-> A thinking-loop guard for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): breaks a model that degrades into a "thinking without doing" loop, so you no longer have to abort the turn by hand
+> A thinking-loop guard for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH): when a model degrades into a "thinking without doing" loop it **breaks the call and injects a correction, so the task carries on** — no more aborting the turn by hand
 
 **🌏 [中文](README.md) | English**
 

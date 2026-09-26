@@ -1,6 +1,6 @@
 # dsh-loop-guard — DSH 思考循环守护
 
-> 为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）提供的思考循环守护插件：模型陷入「只想不做」的退化循环时自动打断，不必再手动中止
+> 为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）提供的思考循环守护插件：模型陷入「只想不做」的退化循环时**自动打断并注入纠正提示，任务继续往下走**，不必再手动中止
 
 **🌏 中文 | [English](README_EN.md)**
 
