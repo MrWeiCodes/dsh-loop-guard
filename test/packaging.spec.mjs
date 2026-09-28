@@ -87,6 +87,25 @@ test('the READMEs warn about the same-named unscoped package', () => {
   }
 })
 
+test('`prepare` is the single build hook, with no redundant duplicate', () => {
+  // `prepare` runs on BOTH a git install and before `npm publish`, so a separate
+  // `prepublishOnly` would compile twice for no benefit. It was removed; this
+  // asserts it stays removed, and — more importantly — that nobody "cleans up"
+  // `prepare` later on the assumption that `prepublishOnly` still covers publish.
+  // If that happened, a git install would silently have no entry file again,
+  // which is exactly issue #1.
+  assert.equal(
+    pkg.scripts.prepublishOnly,
+    undefined,
+    '`prepare` already runs on publish; a second build hook is redundant',
+  )
+  assert.ok(pkg.scripts.prepare, '`prepare` must remain the one build hook (issue #1)')
+
+  // `build` stays as the explicit manual entry point; it is not a hook, so it
+  // does not run on its own.
+  assert.equal(pkg.scripts.build, 'tsc')
+})
+
 test('the READMEs make no claim about what the unscoped package contains', () => {
   // Anything published under a name this project does not own can change at any
   // time. Describing it — even neutrally, and especially reassuringly — is a claim

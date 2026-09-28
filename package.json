@@ -76,7 +76,6 @@
   "scripts": {
     "build": "tsc",
     "prepare": "tsc",
-    "prepublishOnly": "tsc",
     "test": "node --test \"test/*.spec.mjs\"",
     "analyze": "node tools/analyze-session.mjs"
   },
