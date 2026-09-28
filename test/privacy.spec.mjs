@@ -38,9 +38,17 @@ function scannedFiles() {
     for (const e of entries) {
       if (!e.isFile()) continue
       if (!/\.(mjs|js|json|ts)$/.test(e.name)) continue
-      // This file necessarily contains sample leaks (its coverage test feeds them
-      // in), so scanning it would report its own fixtures. Everything else is in
-      // scope, including the other suites.
+      // This file's sample table is checked separately and by inversion, below:
+      // it necessarily CONTAINS the shapes the rules match (that is how the
+      // coverage test proves the rules work), so running the ordinary "no
+      // identifier at all" scan over it can only ever report its own samples.
+      //
+      // Excluding it outright was the earlier design and it failed exactly as a
+      // blind spot does: the one file guaranteed to be full of path-shaped
+      // strings was the one file never checked, and it had been written with this
+      // machine's real user name, real npx cache hash and a real session UUID in
+      // its samples. The companion test below replaces that blind spot with a
+      // stricter rule — not "no identifiers" but "only declared-synthetic ones".
       if (e.name === 'privacy.spec.mjs') continue
       out.push(join(ROOT, dir, e.name))
     }
@@ -159,18 +167,18 @@ test('the rules catch every separator and escaping form a capture can hold', () 
   // four-backslash path. Each case below is a form a real capture can contain,
   // because a capture may be plain text, JSON-escaped once, or escaped twice.
   const mustCatch = [
-    ['one backslash', 'C:\\Users\\71026\\AppData'],
-    ['two backslashes', 'C:\\\\Users\\\\71026\\\\AppData'],
-    ['four backslashes', 'C:\\\\\\\\Users\\\\\\\\71026\\\\\\\\AppData'],
-    ['forward slashes', 'C:/Users/71026/AppData'],
-    ['mixed separators', 'C:\\/Users\\/71026/AppData'],
-    ['lowercase drive', 'c:\\users\\71026'],
-    ['linux home', '/home/71026/project'],
-    ['macOS home', '/Users/71026/project'],
-    ['npx hash', '_npx\\\\c8633a242642d858'],
-    ['npx hash, one slash', '_npx\\c8633a242642d858'],
-    ['session dir', 'session-e6c96e85-9abf-4487-b1e6-d3e00c635e5b'],
-    ['bare uuid', 'id e6c96e85-9abf-4487-b1e6-d3e00c635e5b'],
+    ['one backslash', 'C:\\Users\\sampleuser\\AppData'],
+    ['two backslashes', 'C:\\\\Users\\\\sampleuser\\\\AppData'],
+    ['four backslashes', 'C:\\\\\\\\Users\\\\\\\\sampleuser\\\\\\\\AppData'],
+    ['forward slashes', 'C:/Users/sampleuser/AppData'],
+    ['mixed separators', 'C:\\/Users\\/sampleuser/AppData'],
+    ['lowercase drive', 'c:\\users\\sampleuser'],
+    ['linux home', '/home/sampleuser/project'],
+    ['macOS home', '/Users/sampleuser/project'],
+    ['npx hash', '_npx\\\\0123456789abcdef'],
+    ['npx hash, one slash', '_npx\\0123456789abcdef'],
+    ['session dir', 'session-11111111-2222-3333-4444-555555555555'],
+    ['bare uuid', 'id 11111111-2222-3333-4444-555555555555'],
     ['sk- key', 'sk-abcdefghijklmnopqrstuvwx'],
     ['jwt', 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghij'],
     ['token assignment', '"accessToken":"abcdefghijklmnop1234"'],
@@ -178,7 +186,7 @@ test('the rules catch every separator and escaping form a capture can hold', () 
   ]
   const mustPass = [
     ['the redaction placeholders', 'C:\\\\Users\\\\user0 _npx\\\\0000000000000000 session-00000000-0000-0000-0000-000000000000'],
-    ['an unrelated number', 'the value is 71026 items'],
+    ['an unrelated number', 'the value is 12345 items'],
     ['a short hex string', 'hash abc123def456'],
     ['an ordinary path without a user', 'C:\\\\Program Files\\\\nodejs'],
   ]
@@ -207,4 +215,45 @@ test('the rules catch every separator and escaping form a capture can hold', () 
     }
     assert.deepEqual(hits, [], `the scan must NOT flag ${label}: ${hits.join(', ')}`)
   }
+})
+
+/**
+ * The samples this file feeds the rules must be synthetic.
+ *
+ * This suite is excluded from the ordinary scan (its samples exist precisely to
+ * match the rules), which left it unchecked — and it had been written with this
+ * machine's real user name, real npx cache hash and a live session UUID. Rather
+ * than exempt it, its matches are checked by INVERSION: every value the rules
+ * find in this file must be one of the declared-synthetic placeholders below, so
+ * pasting a real capture into a sample fails the build instead of shipping.
+ */
+test('this file\'s own samples are synthetic, not captured', () => {
+  const SYNTHETIC = new Set([
+    'sampleuser',                           // invented user name
+    '0123456789abcdef',                     // invented npx cache hash
+    '11111111-2222-3333-4444-555555555555', // invented session UUID
+    'sk-abcdefghijklmnopqrstuvwx',          // invented `sk-` key (rule matches the whole token)
+    'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghij', // invented JWT
+    'abcdefghijklmnop1234',                 // invented token value
+    'abcdefghijklmnop',                     // invented api_key value
+    ...ALLOWED,
+  ])
+  const source = readFileSync(join(HERE, 'privacy.spec.mjs'), 'utf8')
+  const findings = []
+  for (const rule of RULES) {
+    const re = new RegExp(rule.re.source, rule.re.flags)
+    let m
+    while ((m = re.exec(source)) !== null) {
+      const value = m[1] ?? m[0]
+      if (!SYNTHETIC.has(value)) {
+        findings.push(`${rule.name}: ${JSON.stringify(value)} — ${rule.why}`)
+      }
+    }
+  }
+  assert.deepEqual(
+    findings,
+    [],
+    'these samples are not in the declared-synthetic list; if a real capture was '
+    + `pasted in, redact it (and if it is genuinely invented, declare it): ${findings.join('; ')}`,
+  )
 })

@@ -485,7 +485,7 @@ N 是**重复量**，即这次调用里真正重复的字符数（1.0.3 修正�
 node node_modules/dsh-loop-guard/tools/analyze-session.mjs <你的 session.jsonl>
 ```
 
-支持 `assistant/chunk`（v1）与 `assistant/attempt`（v2）两种持久化格式。加 `--json` 输出逐条记录。
+支持 `assistant/chunk`（v1）、`assistant/attempt`（v2 失败/重试的调用）与 `assistant/message`（v2 正常完成的调用）三种持久化记录。加 `--json` 输出逐条记录。
 
 ## 开发
 

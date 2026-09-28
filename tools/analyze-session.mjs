@@ -15,15 +15,33 @@
  *   node tools/analyze-session.mjs <session.jsonl> [--similarity 0.8] [--threshold 3]
  *                                [--min-chars 2048] [--max-fires 4] [--json]
  *
- * Reads both durable attempt formats:
+ * Reads every durable form a settled model call takes:
  *   - `assistant/chunk` (session format v1: dsh <= 0.1.2-rc.1) — one event per
  *     stream chunk, grouped by (turn, step);
- *   - `assistant/attempt` (session format v2: dsh >= 0.1.5) — one event per
- *     attempt carrying the whole compacted `stream` record array.
+ *   - `assistant/attempt` (session format v2: dsh >= 0.1.5) — an attempt that
+ *     settled with NO surface message: a failed, retried, cancelled or
+ *     stream-error call;
+ *   - `assistant/message` (session format v2: dsh >= 0.1.5) — the ORDINARY
+ *     settled call, carrying the committed message plus the same compacted
+ *     `stream` record array.
  *
- * A "step" is one model call, i.e. one (turn, step) group. For each step it
- * reports whether text/tool output was emitted and what the reasoning was, then
- * feeds the same `StepObservation` the plugin feeds at runtime.
+ * ## Why `assistant/message` is not optional
+ *
+ * An earlier version read only `assistant/chunk` and `assistant/attempt`. That
+ * looks like "both formats" but is actually "the v1 format, plus v2's EXCEPTION
+ * path": a normal call commits an `assistant/message`, so the tool saw only the
+ * minority of calls that had failed and been retried. Measured on a real
+ * 8733-message session, the reader found 104 calls instead of 8837 — it reported
+ * `steps: 0` on most sessions and silently under-reported on the rest, which for
+ * a tool whose whole job is "would the guard have fired?" is worse than failing.
+ *
+ * A "step" is one model call. For the v1 format that is one (turn, step) group;
+ * for v2 it is one event, because `agent-loop` re-enters its attempt loop on a
+ * retry and settles each try separately — so a retried step legitimately yields
+ * two or more rows, which is what the plugin saw at runtime (it wraps every
+ * `llm/stream` call, retries included). For each call it reports whether
+ * text/tool output was emitted and what the reasoning was, then feeds the same
+ * `StepObservation` the plugin feeds at runtime.
  *
  * It also reports the **intra-call** shape (issue #2848): the trailing run of
  * identical visible-output chunks inside one call, which is the only measure
@@ -40,7 +58,7 @@
  * is pointed at to answer whether the shipped plugin would have cut it.
  */
 import { readFileSync } from 'node:fs'
-import { LoopDetector, TextRepetitionDetector, countRepeatedText, trailingCycle } from '../lib/index.js'
+import { LoopDetector, ReasoningLoopBreaker, TextRepetitionDetector, countRepeatedText, trailingCycle } from '../lib/index.js'
 
 const DEFAULT_CONFIG = {
   maxThinkingSteps: 3,
@@ -110,7 +128,13 @@ function deltasFromChunkEvent(event) {
 }
 
 /**
- * Flatten one v2 `assistant/attempt` event's compacted stream into deltas.
+ * Flatten one v2 event's compacted stream into deltas.
+ *
+ * Serves BOTH `assistant/attempt` and `assistant/message`: the two events carry
+ * the same `data.stream` field with the same record shape, differing only in
+ * whether a committed `message` accompanies it. Verified against real session
+ * files — extracting from `assistant/message` yields the reasoning and text of
+ * every ordinary call, which is the majority the tool used to miss.
  *
  * The durable stream is a compacted record array, not raw chunks:
  *   - `{ type: 'chunk', time, chunk }` — one chunk, unchanged;
@@ -119,7 +143,7 @@ function deltasFromChunkEvent(event) {
  * Unknown record types are ignored rather than guessed at, so a future format
  * addition degrades to "fewer steps observed" instead of a wrong verdict.
  */
-function deltasFromAttemptEvent(event) {
+function deltasFromStreamEvent(event) {
   const stream = event?.data?.stream
   if (!Array.isArray(stream)) return []
   const out = []
@@ -148,39 +172,89 @@ function deltasFromAttemptEvent(event) {
   return out
 }
 
-/** Group the file's events into per-model-call steps, in file order. */
+/**
+ * Group the file's events into per-model-call steps, in file order.
+ *
+ * The two durable generations need opposite treatment, because the same
+ * coordinate means different things in each:
+ *
+ *  - **v1 `assistant/chunk`** writes one event per stream chunk, so a call is
+ *    the *set* of events sharing a (turn, step) coordinate — they are grouped.
+ *  - **v2** writes one event per settled attempt, so an event *is* a call and
+ *    must NOT be merged by coordinate. `agent-loop` re-enters its attempt loop
+ *    on a retry (`while (true)` around the stream) and settles each try
+ *    separately: a retried step produces an `assistant/attempt` for the failed
+ *    try followed by an `assistant/message` for the successful one, at the SAME
+ *    (turn, step). The plugin wrapped every one of those `llm/stream` calls and
+ *    judged each on its own, so merging them would concatenate the reasoning of
+ *    two distinct calls and hand the detector an input it never saw.
+ *
+ * A call that settled with no content at all (a retry that failed before
+ * emitting anything) is kept rather than dropped: the plugin observed it too,
+ * and `LoopDetector.observe` ignores it on the `minReasoningChars` guard, so
+ * dropping it here would be a second, divergent copy of that rule.
+ */
 function readSteps(lines) {
   const steps = []
+  /** v1 chunk events sharing a coordinate, merged into one call. */
   const byCoordinate = new Map()
   for (const line of lines) {
     if (line.trim().length === 0) continue
     let event
     try { event = JSON.parse(line) } catch { continue }
     const type = event?.type
-    if (type !== 'assistant/chunk' && type !== 'assistant/attempt') continue
-    // v1 chunk events carry (turn, step) in data; v2 attempts are already one step.
+    if (type !== 'assistant/chunk' && type !== 'assistant/attempt' && type !== 'assistant/message') continue
     const turn = event?.data?.turn
     const step = event?.data?.step
+    if (type !== 'assistant/chunk') {
+      const group = newGroup(turn, step, type)
+      steps.push(accumulate(group, deltasFromStreamEvent(event)))
+      continue
+    }
+    // v1: fold this chunk into the call its coordinate identifies.
     const key = `${turn}/${step}`
     let group = byCoordinate.get(key)
     if (group === undefined) {
-      group = { turn, step, reasoning: '', text: '', texts: [], hasOutput: false }
+      group = newGroup(turn, step, type)
       byCoordinate.set(key, group)
       steps.push(group)
     }
-    const deltas = type === 'assistant/chunk' ? deltasFromChunkEvent(event) : deltasFromAttemptEvent(event)
-    for (const delta of deltas) {
-      if (delta.type === 'reasoning-delta') group.reasoning += delta.text
-      else if (isOutputChunk(delta.type)) {
-        group.hasOutput = true
-        group.text += delta.text
-        // Only text deltas participate in the intra-call breaker; tool-argument
-        // deltas are chunked by the provider's own tokenizer.
-        if (delta.type === 'text-delta') group.texts.push(delta.text)
-      }
-    }
+    accumulate(group, deltasFromChunkEvent(event))
   }
   return steps
+}
+
+/** One call's empty accumulator. */
+function newGroup(turn, step, source) {
+  return {
+    turn,
+    step,
+    source,
+    reasoning: '',
+    // Reasoning deltas in stream order: the reasoning breaker is fed chunk by
+    // chunk, so the joined string alone would lose the boundaries the rule sees.
+    reasoningDeltas: [],
+    text: '',
+    texts: [],
+    hasOutput: false,
+  }
+}
+
+/** Fold one call's deltas into its running totals, returning the same object. */
+function accumulate(group, deltas) {
+  for (const delta of deltas) {
+    if (delta.type === 'reasoning-delta') {
+      group.reasoning += delta.text
+      group.reasoningDeltas.push(delta.text)
+    } else if (isOutputChunk(delta.type)) {
+      group.hasOutput = true
+      group.text += delta.text
+      // Only text deltas participate in the intra-call breaker; tool-argument
+      // deltas are chunked by the provider's own tokenizer.
+      if (delta.type === 'text-delta') group.texts.push(delta.text)
+    }
+  }
+  return group
 }
 
 const { file, config, asJson } = parseArgs(process.argv.slice(2))
@@ -204,7 +278,19 @@ for (const [index, step] of steps.entries()) {
   for (const chunk of step.texts) {
     if (breaker.push(chunk)) { brokeAt = breaker.emittedChars; break }
   }
-  const wouldBreakBy = brokeAt > 0 ? (breaker.trippedBy ?? null) : null
+  const textBreakBy = brokeAt > 0 ? (breaker.trippedBy ?? null) : null
+  // The REASONING breaker is a separate rule with its own accumulator, and it is
+  // the one that matters most: a reasoning-only call is the shape that never
+  // settles the step, so nothing downstream can react to it. An earlier version
+  // of this tool ran only the text breaker, so it reported `wouldBreak: false`
+  // for a 183,760-character reasoning bleed that the shipped plugin cuts at
+  // ~25,000 — the tool was blind to exactly the failure it exists to diagnose.
+  const reasoningBreaker = new ReasoningLoopBreaker(config)
+  let reasoningBrokeAt = 0
+  for (const delta of step.reasoningDeltas) {
+    if (reasoningBreaker.push(delta)) { reasoningBrokeAt = reasoningBreaker.emittedChars; break }
+  }
+  const reasoningBreakBy = reasoningBrokeAt > 0 ? (reasoningBreaker.trippedBy ?? null) : null
   const cycleSpan = trailingCycle(step.texts.join(''), config.maxRepeatedCycleChars, config.minRepeatedCycleChars)
   report.push({
     step: index + 1,
@@ -225,8 +311,14 @@ for (const [index, step] of steps.entries()) {
     // The figure the notice would print — taken from the breaker itself so the
     // tool cannot misreport it.
     repeatedChars: breaker.repeatedChars,
-    wouldBreak: wouldBreakBy !== null,
-    wouldBreakBy,
+    // Which side broke, and where. A call can carry both a reasoning bleed and
+    // visible output, so the two are reported separately rather than collapsed
+    // into one boolean: `wouldBreakBy` names the rule, `brokeIn` names the side.
+    wouldBreak: textBreakBy !== null || reasoningBreakBy !== null,
+    wouldBreakBy: textBreakBy ?? reasoningBreakBy,
+    brokeIn: textBreakBy !== null ? 'text' : reasoningBreakBy !== null ? 'reasoning' : null,
+    reasoningBrokeAt,
+    reasoningRepeatedChars: reasoningBreaker.repeatedChars,
   })
 }
 const broken = report.filter(r => r.wouldBreak).length
@@ -245,8 +337,8 @@ if (asJson) {
       + `${String(row.reasoningChars).padStart(9)}  ${String(row.textChars).padStart(9)}  `
       + `${String(row.textChunks).padStart(6)}  ${row.verdict.padEnd(18)}  ${String(row.fired ?? '').padEnd(5)}  `
       + `${String(row.repeatedRun).padStart(11)}  ${String(row.cycleSpan).padStart(9)}  `
-      + `${String(row.repeatedChars).padStart(13)}  `
-      + `${row.wouldBreak ? `BREAK(${row.wouldBreakBy})` : ''}`,
+      + `${String(row.brokeIn === 'reasoning' ? row.reasoningRepeatedChars : row.repeatedChars).padStart(13)}  `
+      + `${row.wouldBreak ? `BREAK(${row.wouldBreakBy} in ${row.brokeIn})` : ''}`,
     )
   }
   const stalls = report.filter(r => r.verdict !== 'progress').length
@@ -256,10 +348,16 @@ if (asJson) {
   console.log(`stalled steps: ${stalls}/${report.length}  |  reactions: ${fires}  |  steps that emitted text: ${withText}`)
   const byChunks = report.filter(r => r.wouldBreakBy === 'identical-chunks').length
   const byCycle = report.filter(r => r.wouldBreakBy === 'repeating-cycle').length
+  const byTextLines = report.filter(r => r.wouldBreakBy === 'text-lines').length
+  const byReasoning = report.filter(r => r.brokeIn === 'reasoning').length
   console.log(`intra-call repetition: ${broken} call(s) would be cut mid-stream `
     + `(${byChunks} by identical chunks, maxRepeatedText = ${config.maxRepeatedText}; `
     + `${byCycle} by a repeating cycle, maxRepeatedCycleChars = ${config.maxRepeatedCycleChars}, `
-    + `minRepeatedCycleChars = ${config.minRepeatedCycleChars})`)
+    + `minRepeatedCycleChars = ${config.minRepeatedCycleChars}; `
+    + `${byTextLines} by a repeated phrase pool, maxRepeatedTextLineChars = ${config.maxRepeatedTextLineChars})`)
+  console.log(`reasoning-side breaks: ${byReasoning} call(s) `
+    + `(maxRepeatedReasoningCycleChars = ${config.maxRepeatedReasoningCycleChars}, `
+    + `maxRepeatedReasoningLineChars = ${config.maxRepeatedReasoningLineChars})`)
   if (byCycle === 0 && byChunks === 0 && report.some(r => r.repeatedRun > 1)) {
     const worst = Math.max(...report.map(r => r.repeatedRun))
     console.log(`  (the longest identical-chunk run seen was ${worst}; lower --max-repeated-text to cut such calls)`)

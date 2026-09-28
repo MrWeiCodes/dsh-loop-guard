@@ -23,7 +23,8 @@ const PUBLISHED = [
   '0.1.3-alpha.2',
   '0.1.5-alpha.1', '0.1.5-alpha.2', '0.1.5-rc.1', '0.1.5-rc.2', '0.1.5-rc.3',
   '0.1.6-alpha.1', '0.1.6-alpha.2',
-  '0.1.7-alpha.1', '0.1.7-alpha.2', '0.1.7-rc.1',
+  '0.1.7-alpha.1', '0.1.7-alpha.2', '0.1.7-rc.1', '0.1.7-rc.2',
+  '0.2.0-rc.1',
 ]
 
 /**
@@ -45,7 +46,8 @@ const SUPPORTED = [
   '0.1.3-alpha.2',
   '0.1.5-alpha.1', '0.1.5-alpha.2', '0.1.5-rc.1', '0.1.5-rc.2', '0.1.5-rc.3',
   '0.1.6-alpha.1', '0.1.6-alpha.2',
-  '0.1.7-alpha.1', '0.1.7-alpha.2', '0.1.7-rc.1',
+  '0.1.7-alpha.1', '0.1.7-alpha.2', '0.1.7-rc.1', '0.1.7-rc.2',
+  '0.2.0-rc.1',
 ]
 
 /**
@@ -124,5 +126,50 @@ test('the dev pins stay on a line the range admits', () => {
   for (const dep of ['@deepseek-ai/dsh-agent', '@deepseek-ai/dsh-llm']) {
     const pin = pkg.devDependencies[dep]
     assert.ok(SUPPORTED.includes(pin), `devDependency ${dep}@"${pin}" is not in the tested set`)
+  }
+})
+
+test('the 0.2 line is admitted, and the range stays tight above it', () => {
+  // dsh 0.2.0-rc.1 moved the major version, so every `<0.2.0` comparator stopped
+  // covering the running release. Two separate gates then disagree about what
+  // that means, which is why this is asserted on both:
+  //
+  //  - npm installs with DEFAULT semver semantics, under which `<0.2.0` does not
+  //    admit `0.2.0-rc.1` (a comparator admits a prerelease only when some
+  //    comparator in the same group shares its major.minor.patch tuple). The
+  //    install fails with ERESOLVE.
+  //  - the dsh runtime calls `evaluatePluginCompatibility` with
+  //    `{ includePrerelease: true }`, under which `<0.2.0` DOES admit
+  //    `0.2.0-rc.1` but still refuses the `0.2.0` stable release.
+  //
+  // The second gate is the dangerous one: a bundle it rejects is not warned
+  // about, it is thrown out of `loadProfileDirectory` into `skippedBundles` and
+  // the plugin silently never loads. So the range must admit the 0.2 line under
+  // BOTH gates, and must keep refusing anything at or above 0.3.0 so a future
+  // line cannot be admitted by accident.
+  for (const dep of ['@deepseek-ai/dsh-agent', '@deepseek-ai/dsh-llm']) {
+    const range = pkg.peerDependencies[dep]
+    assert.equal(
+      satisfies('0.2.0-rc.1', range),
+      true,
+      `${dep} must admit 0.2.0-rc.1 under npm's default semantics, or the install fails`,
+    )
+    assert.equal(
+      satisfies('0.2.0-rc.1', range, { includePrerelease: true }),
+      true,
+      `${dep} must admit 0.2.0-rc.1 under the dsh runtime's semantics, or the bundle is skipped`,
+    )
+    assert.equal(
+      satisfies('0.2.0', range, { includePrerelease: true }),
+      true,
+      `${dep} must admit the 0.2.0 stable release, or the plugin dies the day it ships`,
+    )
+    for (const beyond of ['0.3.0-rc.1', '0.3.0', '1.0.0']) {
+      assert.equal(
+        satisfies(beyond, range),
+        false,
+        `${dep} must not admit ${beyond}: that line has never been tested`,
+      )
+    }
   }
 })

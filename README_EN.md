@@ -493,7 +493,7 @@ Use the offline analyzer, which runs the **same detector the plugin runs**:
 node node_modules/dsh-loop-guard/tools/analyze-session.mjs <your-session.jsonl>
 ```
 
-It reads both durable formats, `assistant/chunk` (v1) and `assistant/attempt` (v2). Add `--json` for the raw per-step records.
+It reads every durable form a settled call takes: `assistant/chunk` (v1), `assistant/attempt` (v2 — a failed, retried or cancelled call) and `assistant/message` (v2 — an ordinary completed call). Add `--json` for the raw per-step records.
 
 ## Development
 

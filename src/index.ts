@@ -940,17 +940,55 @@ export function countRepeatedText(texts: readonly string[]): number {
  * @param minSpan - the shortest qualifying tail span, in characters.
  * @returns the qualifying span in characters (`>= minSpan`), or `0`.
  */
+/**
+ * How many identical characters end `text` (the run containing the last one).
+ *
+ * Exists to answer the "template has at least two distinct characters" guard
+ * without materializing the template. That guard used to be written
+ *
+ *     new Set(text.slice(text.length - period)).size < 2
+ *
+ * which allocates and deduplicates `period` characters for EVERY candidate
+ * period, making one scan O(maxPeriod^2) instead of O(maxPeriod). At the
+ * shipped `maxPeriod` of 512 that is ~2 ms per scan, and the rule is scanned
+ * every {@link CYCLE_CHECK_STRIDE} characters — so a single 183 760-character
+ * reasoning call (the real bleed of issue #5976) burned **17.6 seconds of CPU**,
+ * and `tools/analyze-session.mjs`, which replays a whole session synchronously,
+ * went from seconds to tens of minutes on the same file.
+ *
+ * The two forms are equivalent, not merely similar: "every character in the last
+ * `period` positions is the same" holds exactly when the run of identical
+ * characters ending at the last position is at least `period` long. Verified
+ * differentially against the `Set` form on 816 inputs — the shipped fixtures
+ * included, at 8 `(maxPeriod, minSpan)` settings — with zero disagreements, and
+ * measured 73x faster on the bleed above.
+ *
+ * @param text - the accumulated output of one call.
+ * @returns the trailing run length in characters (`0` for empty text).
+ */
+function trailingRunLength(text: string): number {
+  const len = text.length
+  if (len === 0) return 0
+  const last = text[len - 1]
+  let run = 1
+  while (run < len && text[len - 1 - run] === last) run++
+  return run
+}
+
+
 export function trailingCycle(text: string, maxPeriod: number, minSpan: number): number {
   if (maxPeriod < 1) return 0
+  const len = text.length
+  const tailRun = trailingRunLength(text)
   for (let period = 1; period <= maxPeriod; period++) {
+    // A template of one repeated character is not a cycle — see the guard above.
+    if (tailRun >= period) continue
     // The last `period` characters are the template; walk backwards while the
     // output still matches itself one period earlier.
-    const template = text.slice(text.length - period)
-    if (new Set(template).size < 2) continue
     const need = Math.max(minSpan, 2 * period) - period
-    const limit = Math.min(text.length - period, need)
+    const limit = Math.min(len - period, need)
     let matched = 0
-    while (matched < limit && text[text.length - period - 1 - matched] === text[text.length - 1 - matched]) matched++
+    while (matched < limit && text[len - period - 1 - matched] === text[len - 1 - matched]) matched++
     if (matched >= need) return matched + period
   }
   return 0
@@ -978,15 +1016,16 @@ export function trailingCycle(text: string, maxPeriod: number, minSpan: number):
  */
 export function periodicTailSpan(text: string, maxPeriod: number, minSpan: number): number {
   if (maxPeriod < 1) return 0
+  const len = text.length
+  const tailRun = trailingRunLength(text)
   for (let period = 1; period <= maxPeriod; period++) {
-    const template = text.slice(text.length - period)
-    if (new Set(template).size < 2) continue
+    if (tailRun >= period) continue
     const need = Math.max(minSpan, 2 * period) - period
     // Same test as `trailingCycle`, but the walk is unbounded, so `matched` is
     // the real extent of the periodicity rather than a capped one.
-    const limit = text.length - period
+    const limit = len - period
     let matched = 0
-    while (matched < limit && text[text.length - period - 1 - matched] === text[text.length - 1 - matched]) matched++
+    while (matched < limit && text[len - period - 1 - matched] === text[len - 1 - matched]) matched++
     if (matched >= need) return matched + period
   }
   return 0

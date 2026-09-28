@@ -273,3 +273,125 @@ test('analyzer does not flag a legitimately repetitive but healthy call', () => 
   assert.equal(steps[0].cycleSpan, 0)
   assert.equal(steps[0].wouldBreak, false)
 })
+
+/* -------------------------------------------------------------------------- */
+/* ordinary calls: `assistant/message` is the MAJORITY case, not an extra      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The reader used to accept only `assistant/chunk` and `assistant/attempt`.
+ * That reads like "both durable formats" but is really "v1, plus v2's EXCEPTION
+ * path": a normal call commits an `assistant/message`, so the tool saw only the
+ * calls that had failed and been retried. On a real session that was 104 of 8837
+ * calls, and on most sessions it printed `steps: 0` — for a tool whose only job
+ * is "would the guard have fired?", silently answering "no calls" is the worst
+ * possible failure.
+ */
+test('analyzer reads ordinary calls from assistant/message', () => {
+  const file = writeSession([
+    { type: 'assistant/message', seq: 0, time: 0, data: {
+      turn: 0, step: 0,
+      message: { id: 'm1', role: 'assistant', content: [{ type: 'reasoning', text: STALLED }] },
+      stream: [{ type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] }],
+    } },
+    { type: 'assistant/message', seq: 1, time: 1, data: {
+      turn: 0, step: 1,
+      message: { id: 'm2', role: 'assistant', content: [{ type: 'reasoning', text: STALLED }, { type: 'text', text: 'done' }] },
+      stream: [
+        { type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] },
+        { type: 'text-chunks', time0: 1, texts: [[1, 'done']] },
+      ],
+    } },
+  ])
+  const { steps } = run(file)
+  assert.equal(steps.length, 2, 'both ordinary calls must be read')
+  assert.equal(steps[0].verdict, 'reasoning-only')
+  assert.equal(steps[1].verdict, 'repeated-material')
+  assert.equal(steps[1].textChars, 'done'.length)
+})
+
+test('a retried step is reported as two calls, not merged into one', () => {
+  // `agent-loop` re-enters its attempt loop on a retry and settles each try
+  // separately, so a failed `assistant/attempt` and the successful
+  // `assistant/message` share a (turn, step). The plugin wrapped BOTH
+  // `llm/stream` calls and judged each on its own, so the analyzer must not
+  // concatenate them: merging would feed the detector an input it never saw.
+  const file = writeSession([
+    { type: 'assistant/attempt', seq: 0, time: 0, data: { turn: 0, step: 0, stream: [
+      { type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] },
+    ] } },
+    { type: 'assistant/message', seq: 1, time: 1, data: {
+      turn: 0, step: 0,
+      message: { id: 'm1', role: 'assistant', content: [] },
+      stream: [
+        { type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] },
+        { type: 'text-chunks', time0: 1, texts: [[1, 'recovered']] },
+      ],
+    } },
+  ])
+  const { steps } = run(file)
+  assert.equal(steps.length, 2, 'one row per settled attempt')
+  assert.equal(steps[0].verdict, 'reasoning-only', 'the failed try had no output')
+  assert.equal(steps[1].verdict, 'repeated-material')
+  // Not merged: each row carries only its own call's material.
+  assert.equal(steps[0].textChars, 0)
+  assert.equal(steps[1].textChars, 'recovered'.length)
+})
+
+/* -------------------------------------------------------------------------- */
+/* the reasoning-side breaker                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The tool ran only the TEXT breaker, so it reported `wouldBreak: false` for the
+ * 183 760-character reasoning bleed of issue #5976 that the shipped plugin cuts
+ * at character 25 343. It was blind to exactly the failure it exists to explain.
+ */
+test('analyzer runs the reasoning breaker, not just the text one', () => {
+  // A long reasoning bleed: one short unit cycled far past every threshold.
+  // Delivered as many small deltas, which is how a provider streams — a single
+  // giant delta would let the breaker see the whole bleed at once and report a
+  // cut position equal to the total, hiding whether the walk works at all.
+  const unit = 'Let me read the section.\nGo.\nOK.\n'
+  const pieces = Array.from({ length: 400 }, () => unit)
+  const reasoning = pieces.join('')
+  assert.ok(reasoning.length > 8000, `fixture must be long enough, got ${reasoning.length}`)
+  const file = writeSession([
+    { type: 'assistant/message', seq: 0, time: 0, data: {
+      turn: 0, step: 0,
+      message: { id: 'm1', role: 'assistant', content: [{ type: 'reasoning', text: reasoning }] },
+      stream: [{ type: 'reasoning-chunks', time0: 0, texts: pieces.map((text, i) => [i, text]) }],
+    } },
+  ])
+  const { steps } = run(file)
+  assert.equal(steps[0].reasoningChars, reasoning.length)
+  assert.equal(steps[0].wouldBreak, true, 'the reasoning breaker must fire')
+  assert.equal(steps[0].brokeIn, 'reasoning', 'and it must be attributed to the reasoning side')
+  assert.ok(
+    ['reasoning-cycle', 'reasoning-lines'].includes(steps[0].wouldBreakBy),
+    `unexpected rule: ${steps[0].wouldBreakBy}`,
+  )
+  assert.ok(steps[0].reasoningBrokeAt > 0, 'the cut position must be reported')
+  assert.ok(
+    steps[0].reasoningBrokeAt < reasoning.length,
+    `the cut must land inside the bleed, got ${steps[0].reasoningBrokeAt} of ${reasoning.length}`,
+  )
+})
+
+test('a healthy reasoning call is not cut by the reasoning breaker', () => {
+  // The control: substantial reasoning that does not repeat must survive. Without
+  // this, a rule that fired on everything would satisfy the test above.
+  const paragraphs = Array.from({ length: 60 }, (_, i) =>
+    `Step ${i}: the reader opened file number ${i} and confirmed that its retry budget of ${i + 3} attempts was not the cause.`)
+  const reasoning = paragraphs.join('\n')
+  const file = writeSession([
+    { type: 'assistant/message', seq: 0, time: 0, data: {
+      turn: 0, step: 0,
+      message: { id: 'm1', role: 'assistant', content: [{ type: 'reasoning', text: reasoning }] },
+      stream: [{ type: 'reasoning-chunks', time0: 0, texts: [[0, reasoning]] }],
+    } },
+  ])
+  const { steps } = run(file)
+  assert.equal(steps[0].wouldBreak, false, 'non-repeating reasoning must not be cut')
+  assert.equal(steps[0].brokeIn, null)
+})
