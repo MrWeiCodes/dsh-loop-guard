@@ -172,3 +172,83 @@ test('the declared files all exist, so npm pack ships what it promises', () => {
   }
   assert.deepEqual(missing, [], `declared in \`files\` but absent from the repository: ${missing.join(', ')}`)
 })
+
+test('the "reasoning side only" README example disables every visible-output rule', () => {
+  // The example claims to leave visible output untouched, so it must zero every
+  // rule a `maxRepeated*` field can switch off. It once missed
+  // `maxRepeatedTextLineChars` — the visible-output phrase-pool rule added in
+  // v1.0.5 — so a reader who copied it still had a visible-output rule armed
+  // while believing it was off. That is the drift this test exists to catch:
+  // the field list is derived from the schema, so ADDING a rule fails here until
+  // the example covers it.
+  const source = readFileSync(join(ROOT, 'src/index.ts'), 'utf8')
+  const gating = [...source.matchAll(/^\s{2}(maxRepeated\w+): z\.number\(\)/gm)].map((m) => m[1])
+  assert.ok(
+    gating.length >= 5,
+    `expected the rule-gating maxRepeated* fields in the Config schema, found: ${gating.join(', ') || '(none)'}`,
+  )
+
+  // Which side a field governs is part of its name: the reasoning rules carry it.
+  const visible = gating.filter((f) => !f.includes('Reasoning'))
+  const reasoning = gating.filter((f) => f.includes('Reasoning'))
+  assert.ok(visible.length >= 3, `expected visible-output rules, got ${visible.join(', ')}`)
+  assert.ok(reasoning.length >= 2, `expected reasoning rules, got ${reasoning.join(', ')}`)
+
+  for (const file of ['README.md', 'README_EN.md']) {
+    const text = readFileSync(join(ROOT, file), 'utf8')
+    const blocks = [...text.matchAll(/```yaml\n([\s\S]*?)```/g)].map((m) => m[1])
+    // Identified by its content rather than its heading, so rewording the title
+    // does not silently detach the test from the example.
+    const example = blocks.find((b) => b.includes('maxThinkingSteps: 999'))
+    assert.ok(example, `${file}: the "reasoning side only" example must exist`)
+
+    // Only ACTIVE lines count: the example carries commented-out alternatives
+    // (e.g. how to also drop the reasoning-side pool), and a comment must not be
+    // read as if it were applied.
+    const active = example.split('\n').filter((line) => !/^\s*#/.test(line)).join('\n')
+
+    for (const field of visible) {
+      assert.ok(
+        new RegExp(`${field}:\\s*0\\b`).test(active),
+        `${file}: the example claims to leave visible output untouched, but ${field} is still armed`,
+      )
+    }
+    for (const field of reasoning) {
+      assert.ok(
+        !new RegExp(`${field}:\\s*0\\b`).test(active),
+        `${file}: ${field} governs reasoning, so this example must NOT disable it`,
+      )
+    }
+  }
+})
+
+test('the READMEs do not promise the agent is never cancelled', () => {
+  // `escalate: cancel` calls `agent.cancel()`, and the same README documents that
+  // setting two sections later. An unqualified "never calls agent.cancel()" is
+  // therefore false, and it contradicted the plugin's own example.
+  for (const file of ['README.md', 'README_EN.md']) {
+    const text = readFileSync(join(ROOT, file), 'utf8')
+    assert.ok(
+      !/永远不会调用\s*`agent\.cancel\(\)`|never calls\s*`agent\.cancel\(\)`/.test(text),
+      `${file} must qualify that claim: escalate: cancel DOES call agent.cancel()`,
+    )
+  }
+})
+
+test('the copy-paste config examples say a restart is needed', () => {
+  // Config is read when the plugin loads, so a YAML edit alone changes nothing
+  // until `dsh web` restarts. An example that omits this leaves the reader
+  // believing the change did not work.
+  for (const [file, needle] of [
+    ['README.md', '重启 `dsh web`'],
+    ['README_EN.md', 'restart `dsh web`'],
+  ]) {
+    const text = readFileSync(join(ROOT, file), 'utf8')
+    const section = /(?:### 常见需求（直接抄）|### Common setups \(copy-paste\))([\s\S]*?)```/.exec(text)
+    assert.ok(section, `${file}: the copy-paste section must exist`)
+    assert.ok(
+      section[1].includes(needle),
+      `${file}: the copy-paste section must state that ${needle} is required`,
+    )
+  }
+})

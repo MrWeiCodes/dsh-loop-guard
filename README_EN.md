@@ -73,6 +73,24 @@ In the trajectory view (the `CONTEXT` row):
 - a single call flooding identical visible output → cut from inside the stream;
 - normal long reasoning and legitimately repetitive output (tables, logs, CSS, JSON) → **not touched**.
 
+> **Want to tune it?** See [Configuration](#configuration) below — it has copy-paste YAML.
+>
+> **Why the official Plugins page offers no configuration form**
+>
+> - **Most users never need it.** The defaults are designed to be left alone — install it and it
+>   works: it breaks what should be broken and leaves alone what should be left alone.
+> - **Changing them usually makes things worse.** 13 of the 20 fields are detection thresholds
+>   calibrated against real data. Intuition pushes toward **more sensitive** (lower
+>   `maxThinkingSteps`, lower `minReasoningChars`), and the cost is false positives on
+>   legitimate long reasoning — from "almost never wrong" to "frequently wrong".
+> - **It is easy to get wrong.** The thresholds are coupled, so changing one often has no effect
+>   or backfires: disabling a rule means setting its `max*` to `0`, and adjusting the `min*`
+>   alone does nothing. A form would not surface those couplings; the README does.
+>
+> Only four fields are worth touching, and they are **behavioural choices** rather than
+> calibrated thresholds: `escalate`, `resumeAfterBreak`, `breakCorrection`, `maxThinkingSteps`.
+> They go in the profile's `cordis.patch.yml`; restart `dsh web` to apply.
+
 ### What happens when a call is cut
 
 **The session continues and the task carries on** — you do not restart anything or re-issue the instruction.
@@ -93,7 +111,7 @@ So the experience is: **loop → cut within a few hundred characters → the mod
 
 The cost is that **the turn-end reason is no longer distinctive** (`completed` is indistinguishable from a normal finish). The traces live in the injected `notice` and the host warn log. That is a deliberate trade: the point of a break is to keep the session usable, not to raise an alarm.
 
-The plugin **ends the call, never the agent** — it never calls `agent.cancel()`.
+By default the plugin **ends the call, not the agent** — under the default configuration (`escalate: steer`) it does not call `agent.cancel()`. It aborts the turn only when `escalate: cancel` is set explicitly (see item 4 under Common setups below).
 
 ### Automatic continuation (`resumeAfterBreak`)
 
@@ -282,25 +300,30 @@ interface Config {
 
 ### Common setups (copy-paste)
 
+After editing the profile's `cordis.patch.yml`, **restart `dsh web`** for the change to take effect (config is read when the plugin loads).
+
 ```yaml
-# 1. More sensitive: react after 2 stalled calls
+# 1. More sensitive: react after 2 stalled calls (default 3)
 - id: loop-guard
   config:
     maxThinkingSteps: 2
 
-# 2. Unattended: pick the work back up after a loop
+# 2. Unattended: pick the work back up after a loop (default false)
 - id: loop-guard
   config:
     resumeAfterBreak: true
 
-# 3. Keep only the reasoning-cycle rule, disable everything else
+# 3. Keep only the reasoning-side detection, leave visible output untouched
 - id: loop-guard
   config:
-    maxThinkingSteps: 999
-    maxRepeatedText: 0
-    maxRepeatedCycleChars: 0
+    maxThinkingSteps: 999              # disable the cross-call judgement
+    maxRepeatedText: 0                 # disable identical-chunks
+    maxRepeatedCycleChars: 0           # disable repeating-cycle
+    maxRepeatedTextLineChars: 0        # disable text-lines
+    # To also drop the reasoning-side phrase pool, keeping only reasoning-cycle:
+    # maxRepeatedReasoningLineChars: 0
 
-# 4. Hard stop: no steer, abort the turn
+# 4. Hard stop: no steer, abort the turn (default steer)
 - id: loop-guard
   config:
     escalate: cancel

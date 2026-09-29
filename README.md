@@ -73,6 +73,21 @@ DSH **0.1.7** 把「上下文」类消息**从聊天区可见行里排除了**�
 - 单次调用刷屏式重复可见输出 → 自动从流内部切断；
 - 正常的长推理、正常的重复性输出（表格、日志、CSS、JSON）→ **不误伤**。
 
+> **想调？** 见下面的[配置](#配置)一节，里面有可直接复制的 YAML。
+>
+> **官方「插件」页为什么不提供配置表单**
+>
+> - **绝大多数用户用不到。** 默认值就是为「不用调」设计的——装好即用，该拦的拦、该放过的放过。
+> - **改了多半会更差。** 20 个字段里 13 个是检测阈值，默认值按真实数据标定。凭直觉调（把
+>   `maxThinkingSteps` 调小、把 `minReasoningChars` 调低）方向通常是**变灵敏**，
+>   代价是误伤正常的长推理——从「几乎不误报」变成「频繁误报」。
+> - **容易漏。** 阈值是配套的，只改一个常常不生效甚至起反作用：想关掉某条规则要把它的
+>   `max*` 置 `0`，只调 `min*` 没用。表单不会提示这些耦合关系，README 会。
+>
+> 真正值得动、且属于**行为选择**（而非阈值标定）的只有 4 个：`escalate`、
+> `resumeAfterBreak`、`breakCorrection`、`maxThinkingSteps`。改 profile 的
+> `cordis.patch.yml`，重启 `dsh web` 生效。
+
 ### 熔断后会发生什么
 
 **会话继续，任务可以往下走**——不需要你手动重启或重新发指令。
@@ -93,7 +108,7 @@ DSH **0.1.7** 把「上下文」类消息**从聊天区可见行里排除了**�
 
 代价是**回合结束原因不再有辨识度**（`completed` 与正常完成无法区分）。痕迹留在两处：注入的 `notice`，以及宿主日志里的 warn。这是刻意的取舍——熔断的目的是让会话**继续可用**，不是制造告警。
 
-插件**只结束这次调用，从不结束 agent**——它永远不会调用 `agent.cancel()`。
+插件**默认只结束这次调用，不结束 agent**——默认配置（`escalate: steer`）下它不会调用 `agent.cancel()`。只有显式设置 `escalate: cancel` 时才会中止回合（见下面「常见需求」第 4 条）。
 
 ### 自动续跑（`resumeAfterBreak`）
 
@@ -274,25 +289,30 @@ interface Config {
 
 ### 常见需求（直接抄）
 
+改完 profile 的 `cordis.patch.yml` 后**重启 `dsh web`** 才生效（配置在插件加载时读取）。
+
 ```yaml
-# 1. 更灵敏：连续 2 次停滞就反应
+# 1. 更灵敏：连续 2 次停滞就反应（默认 3）
 - id: loop-guard
   config:
     maxThinkingSteps: 2
 
-# 2. 无人值守：循环后自动接上
+# 2. 无人值守：循环后自动接上（默认 false）
 - id: loop-guard
   config:
     resumeAfterBreak: true
 
-# 3. 只想要推理循环这一条，其余全部关掉
+# 3. 只保留推理侧的检测，完全不碰可见输出
 - id: loop-guard
   config:
-    maxThinkingSteps: 999
-    maxRepeatedText: 0
-    maxRepeatedCycleChars: 0
+    maxThinkingSteps: 999              # 关掉跨调用判定
+    maxRepeatedText: 0                 # 关掉 identical-chunks
+    maxRepeatedCycleChars: 0           # 关掉 repeating-cycle
+    maxRepeatedTextLineChars: 0        # 关掉 text-lines
+    # 连推理侧的短语池也关掉、只留 reasoning-cycle 一条，再加：
+    # maxRepeatedReasoningLineChars: 0
 
-# 4. 硬停：不 steer，直接中止回合
+# 4. 硬停：不 steer，直接中止回合（默认 steer）
 - id: loop-guard
   config:
     escalate: cancel
