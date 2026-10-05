@@ -12,8 +12,17 @@
  * installed guard would have decided).
  *
  * Usage:
- *   node tools/analyze-session.mjs <session.jsonl> [--similarity 0.8] [--threshold 3]
+ *   node tools/analyze-session.mjs <session.jsonl | session.v4.jsonl.zstd>
+ *                                [--similarity 0.8] [--threshold 3]
  *                                [--min-chars 2048] [--max-fires 4] [--json]
+ *
+ * Both plain jsonl and DSH's multi-frame zstd session files are accepted; the
+ * format is detected from the content, not the extension (issue #5).
+ *
+ * This module imports `../lib/detector.js` and must never import `../lib/index.js`:
+ * the plugin shell pulls in `@deepseek-ai/*`, which on a DSH Desktop install live
+ * only inside `app.asar` and are unresolvable to a plain `node` process
+ * (issue #4). `test/detector-purity.spec.mjs` enforces both halves.
  *
  * Reads every durable form a settled model call takes:
  *   - `assistant/chunk` (session format v1: dsh <= 0.1.2-rc.1) — one event per
@@ -58,7 +67,11 @@
  * is pointed at to answer whether the shipped plugin would have cut it.
  */
 import { readFileSync } from 'node:fs'
-import { LoopDetector, ReasoningLoopBreaker, TextRepetitionDetector, countRepeatedText, trailingCycle } from '../lib/index.js'
+import { zstdDecompressSync } from 'node:zlib'
+import { LoopDetector, ReasoningLoopBreaker, TextRepetitionDetector, countRepeatedText, trailingCycle } from '../lib/detector.js'
+
+/** zstd frame magic (`28 b5 2f fd`), the only reliable way to find frame starts. */
+const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
 
 const DEFAULT_CONFIG = {
   maxThinkingSteps: 3,
@@ -95,7 +108,7 @@ function parseArgs(argv) {
     if (arg.startsWith('--')) throw new Error(`unknown flag ${arg}`)
     file = arg
   }
-  if (file === undefined) throw new Error('usage: node tools/analyze-session.mjs <session.jsonl> [--json]')
+  if (file === undefined) throw new Error('usage: node tools/analyze-session.mjs <session.jsonl | session.v4.jsonl.zstd> [--json]')
   return { file, config, asJson }
 }
 
@@ -257,8 +270,62 @@ function accumulate(group, deltas) {
   return group
 }
 
+/**
+ * Read a session file as jsonl text, transparently inflating `.zstd` input.
+ *
+ * Issue #5: DSH stores a session as `session.v4.jsonl.zstd`, which is NOT one
+ * zstd stream but a concatenation of independent frames with no separator bytes.
+ * Two traps make the naive approaches fail *silently or confusingly*:
+ *
+ *   - `zstdDecompressSync(wholeFile)` succeeds and returns only the FIRST frame
+ *     (the 191-byte `session` header), which reads as "the file is nearly empty"
+ *     rather than "you must split the frames yourself";
+ *   - Node's streaming `createZstdDecompress()` throws `Unknown frame descriptor`
+ *     on the second frame, so it cannot be piped through either.
+ *
+ * So the frames are located by the zstd magic number and inflated one by one.
+ * Detection is by content, not by file extension: a `.jsonl` file is passed
+ * through untouched, and a `.zstd` file works even when renamed.
+ *
+ * @param file - path to a plain jsonl or a multi-frame zstd session file.
+ * @returns the decoded text, one JSON event per line.
+ */
+function readSessionText(file) {
+  const buf = readFileSync(file)
+  const at = buf.indexOf(ZSTD_MAGIC)
+  // Not zstd (or no frame at all): treat as plain jsonl.
+  if (at < 0) return buf.toString('utf8')
+  // A magic number at a non-zero offset would mean a corrupt prefix; only a
+  // header at offset 0 is a real zstd session file.
+  if (at !== 0) return buf.toString('utf8')
+
+  const offsets = []
+  for (let i = 0; ;) {
+    const next = buf.indexOf(ZSTD_MAGIC, i)
+    if (next < 0) break
+    offsets.push(next)
+    i = next + 1
+  }
+
+  const lines = []
+  let failed = 0
+  for (let n = 0; n < offsets.length; n++) {
+    const start = offsets[n]
+    const end = n + 1 < offsets.length ? offsets[n + 1] : buf.length
+    try {
+      const text = zstdDecompressSync(buf.subarray(start, end)).toString('utf8')
+      // A frame may hold several newline-separated events.
+      for (const line of text.split('\n')) if (line.trim().length > 0) lines.push(line)
+    } catch {
+      failed++
+    }
+  }
+  if (failed > 0) process.stderr.write(`analyze-session: ${failed}/${offsets.length} zstd frame(s) failed to inflate\n`)
+  return lines.join('\n')
+}
+
 const { file, config, asJson } = parseArgs(process.argv.slice(2))
-const lines = readFileSync(file, 'utf8').split('\n')
+const lines = readSessionText(file).split('\n')
 const steps = readSteps(lines)
 
 const detector = new LoopDetector({ pollMs: 0, graceMs: 0, escalate: 'steer', ...config })

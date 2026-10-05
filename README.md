@@ -499,13 +499,21 @@ N 是**重复量**，即这次调用里真正重复的字符数（1.0.3 修正�
 
 **Q：怎么看某次会话该不该触发？**
 
-用离线分析器，它跑的是插件运行时**同一个检测器**：
+用离线分析器，它跑的是插件运行时**同一个检测器**。直接把会话文件喂给它即可——它同时接受纯 `.jsonl` 和 DSH 存的 `session.v4.jsonl.zstd`（多帧 zstd，按内容自动识别）：
 
 ```powershell
-node node_modules/dsh-loop-guard/tools/analyze-session.mjs <你的 session.jsonl>
+node node_modules/@mrweicodes/dsh-loop-guard/tools/analyze-session.mjs <你的 session.v4.jsonl.zstd>
 ```
 
 支持 `assistant/chunk`（v1）、`assistant/attempt`（v2 失败/重试的调用）与 `assistant/message`（v2 正常完成的调用）三种持久化记录。加 `--json` 输出逐条记录。
+
+如果想把解压后的 jsonl 留一份（例如做二次处理），可以单独用 `tools/decompress-session.mjs`：
+
+```powershell
+node node_modules/@mrweicodes/dsh-loop-guard/tools/decompress-session.mjs <session.v4.jsonl.zstd> out.jsonl
+```
+
+**DSH Desktop 用户**：Desktop 把 `@deepseek-ai/*` 封在 `app.asar` 里，profile 的 `node_modules` 中没有它们。分析器只依赖 `lib/detector.js`（零 `@deepseek-ai` 依赖），所以能正常跑；但**不要**去 import `lib/index.js`——那是插件外壳，会拉进整个 Cordis 依赖图并报 `ERR_MODULE_NOT_FOUND`。
 
 ## 开发
 

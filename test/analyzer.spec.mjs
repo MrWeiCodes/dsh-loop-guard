@@ -15,6 +15,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { zstdCompressSync } from 'node:zlib'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -59,6 +60,23 @@ function writeSession(lines) {
 function run(file, extra = []) {
   const out = execFileSync(process.execPath, [ANALYZER, file, '--json', '--min-chars', '8', '--threshold', '2', ...extra], { encoding: 'utf8' })
   return JSON.parse(out)
+}
+
+/**
+ * Write a DSH-shaped session file: one independent zstd frame per event, with
+ * NO separator bytes between frames.
+ *
+ * This is the format issue #5 is about, and the shape matters — a single zstd
+ * stream containing the whole file would pass a naive test while the real file
+ * still failed, because `zstdDecompressSync` on a concatenation silently returns
+ * only the first frame.
+ */
+function writeZstdSession(lines) {
+  const dir = scratchDir()
+  const file = join(dir, 'session.v4.jsonl.zstd')
+  const frames = lines.map((line) => zstdCompressSync(Buffer.from(`${JSON.stringify(line)}\n`, 'utf8')))
+  writeFileSync(file, Buffer.concat(frames))
+  return file
 }
 
 test('analyzer reads v1 assistant/chunk events and groups them by (turn, step)', () => {
@@ -394,4 +412,99 @@ test('a healthy reasoning call is not cut by the reasoning breaker', () => {
   const { steps } = run(file)
   assert.equal(steps[0].wouldBreak, false, 'non-repeating reasoning must not be cut')
   assert.equal(steps[0].brokeIn, null)
+})
+
+/* -------------------------------------------------------------------------- */
+/* issue #5: DSH stores sessions as multi-frame zstd, not plain jsonl          */
+/* -------------------------------------------------------------------------- */
+
+test('analyzer reads a multi-frame .zstd session without a separate decompress step', () => {
+  // The two calls are the same fixture as the assistant/message test above, but
+  // written the way DSH actually stores them: one independent zstd frame per
+  // event, concatenated with no separators.
+  const file = writeZstdSession([
+    { type: 'assistant/message', seq: 0, time: 0, data: {
+      turn: 0, step: 0,
+      message: { id: 'm1', role: 'assistant', content: [{ type: 'reasoning', text: STALLED }] },
+      stream: [{ type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] }],
+    } },
+    { type: 'assistant/message', seq: 1, time: 1, data: {
+      turn: 0, step: 1,
+      message: { id: 'm2', role: 'assistant', content: [{ type: 'reasoning', text: STALLED }, { type: 'text', text: 'done' }] },
+      stream: [
+        { type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] },
+        { type: 'text-chunks', time0: 1, texts: [[1, 'done']] },
+      ],
+    } },
+  ])
+  const { steps } = run(file)
+  assert.equal(steps.length, 2, 'both frames must be read, not just the first')
+  assert.equal(steps[0].verdict, 'reasoning-only')
+  assert.equal(steps[1].verdict, 'repeated-material')
+})
+
+test('a zstd session and its decompressed twin produce identical verdicts', () => {
+  // The strongest statement of correctness: the transparent path must not change
+  // the analysis. A decoder that silently dropped frames would still "run", so
+  // comparing the two outputs is what actually proves the frames all arrive.
+  const events = Array.from({ length: 6 }, (_, i) => ({
+    type: 'assistant/message', seq: i, time: i, data: {
+      turn: 0, step: i,
+      message: { id: `m${i}`, role: 'assistant', content: [{ type: 'reasoning', text: STALLED }] },
+      stream: [{ type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] }],
+    },
+  }))
+  const zstdFile = writeZstdSession(events)
+
+  const dir = scratchDir()
+  const jsonlFile = join(dir, 'session.jsonl')
+  writeFileSync(jsonlFile, events.map((e) => JSON.stringify(e)).join('\n') + '\n')
+
+  const fromZstd = run(zstdFile)
+  const fromJsonl = run(jsonlFile)
+  assert.deepEqual(fromZstd.steps, fromJsonl.steps, 'the two paths must agree exactly')
+  assert.equal(fromZstd.steps.length, 6, 'every frame must contribute a call')
+})
+
+test('a frame holding several newline-separated events is split correctly', () => {
+  // DSH frames are not one-event-per-frame: a burst of events can share a single
+  // frame, so a decoder that assumed one event per frame would lose data.
+  const dir = scratchDir()
+  const file = join(dir, 'session.v4.jsonl.zstd')
+  const multi = [
+    { type: 'assistant/message', seq: 0, time: 0, data: {
+      turn: 0, step: 0,
+      message: { id: 'm0', role: 'assistant', content: [{ type: 'reasoning', text: STALLED }] },
+      stream: [{ type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] }],
+    } },
+    { type: 'assistant/message', seq: 1, time: 1, data: {
+      turn: 0, step: 1,
+      message: { id: 'm1', role: 'assistant', content: [{ type: 'reasoning', text: STALLED }] },
+      stream: [{ type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] }],
+    } },
+  ]
+  // ONE frame, TWO events.
+  const payload = Buffer.from(multi.map((e) => JSON.stringify(e)).join('\n') + '\n', 'utf8')
+  writeFileSync(file, zstdCompressSync(payload))
+
+  const { steps } = run(file)
+  assert.equal(steps.length, 2, 'both events inside the single frame must be read')
+})
+
+test('a plain jsonl file is still read as-is (extension is not what decides)', () => {
+  // Detection is by content: a jsonl file whose bytes merely start with '{' must
+  // not be mistaken for zstd, and a zstd file renamed to .jsonl must still work.
+  const plain = writeSession([{ type: 'assistant/message', seq: 0, time: 0, data: {
+    turn: 0, step: 0,
+    message: { id: 'm1', role: 'assistant', content: [{ type: 'reasoning', text: STALLED }] },
+    stream: [{ type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] }],
+  } }])
+  assert.equal(run(plain).steps.length, 1)
+
+  const zstdAsJsonl = writeZstdSession([{ type: 'assistant/message', seq: 0, time: 0, data: {
+    turn: 0, step: 0,
+    message: { id: 'm1', role: 'assistant', content: [{ type: 'reasoning', text: STALLED }] },
+    stream: [{ type: 'reasoning-chunks', time0: 0, texts: [[0, STALLED]] }],
+  } }])
+  assert.equal(run(zstdAsJsonl).steps.length, 1, 'a renamed zstd file must still be decoded')
 })

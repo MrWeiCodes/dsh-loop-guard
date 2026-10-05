@@ -510,13 +510,21 @@ No — it is persisted via `assistant/attempt` and readable in the session jsonl
 
 **Q: How do I check whether a past session should have fired?**
 
-Use the offline analyzer, which runs the **same detector the plugin runs**:
+Use the offline analyzer, which runs the **same detector the plugin runs**. Point it straight at the session file — it accepts both plain `.jsonl` and the `session.v4.jsonl.zstd` DSH actually stores (multi-frame zstd, detected from the content):
 
 ```powershell
-node node_modules/dsh-loop-guard/tools/analyze-session.mjs <your-session.jsonl>
+node node_modules/@mrweicodes/dsh-loop-guard/tools/analyze-session.mjs <your-session.v4.jsonl.zstd>
 ```
 
 It reads every durable form a settled call takes: `assistant/chunk` (v1), `assistant/attempt` (v2 — a failed, retried or cancelled call) and `assistant/message` (v2 — an ordinary completed call). Add `--json` for the raw per-step records.
+
+To keep a decompressed jsonl around (for further processing), use `tools/decompress-session.mjs` on its own:
+
+```powershell
+node node_modules/@mrweicodes/dsh-loop-guard/tools/decompress-session.mjs <session.v4.jsonl.zstd> out.jsonl
+```
+
+**DSH Desktop users**: Desktop keeps `@deepseek-ai/*` inside `app.asar`, so they are absent from the profile's `node_modules`. The analyzer works there because it depends only on `lib/detector.js`, which has **no `@deepseek-ai` imports**; do **not** import `lib/index.js` instead — that is the plugin shell, and it pulls in the whole Cordis graph and aborts with `ERR_MODULE_NOT_FOUND`.
 
 ## Development
 
