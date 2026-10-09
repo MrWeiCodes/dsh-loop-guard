@@ -1,10 +1,11 @@
 {
   "name": "@mrweicodes/dsh-loop-guard",
   "description": "Thinking-loop guard for dsh: observes the llm/stream waterfall and breaks a model that degrades into a loop. Detects two per-call shapes (reasoning-only calls, restated-material calls) and re-fires instead of latching; plus two mid-stream breakers that end a single degenerate call (maxRepeatedText / maxRepeatedCycleChars for visible output, maxRepeatedReasoningCycleChars for a reasoning bleed), which no post-call detector can reach — the reasoning rule is what ends the never-finishing turn of issue #5976. Ships an offline session analyzer that replays a session jsonl through the same detector. Compatible with every published dsh line from 0.1.2-rc.1 through 0.2.0-rc.1.",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
+  "icon": "./icon.svg",
   "exports": {
     ".": {
       "types": "./lib/types/index.d.ts",
@@ -14,6 +15,7 @@
       "types": "./lib/types/detector.d.ts",
       "default": "./lib/detector.js"
     },
+    "./locale/*.json": "./locale/*.json",
     "./src/*": "./src/*",
     "./tools/*": "./tools/*",
     "./package.json": "./package.json"
@@ -24,6 +26,8 @@
     "lib/types/**/*.d.ts",
     "tools/analyze-session.mjs",
     "tools/decompress-session.mjs",
+    "locale/*.json",
+    "icon.svg",
     "cordis.patch.yml",
     "README.md",
     "README_EN.md",

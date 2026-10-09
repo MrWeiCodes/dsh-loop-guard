@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Loop guard",
+    "description": "Detects the repetition loops a model can degenerate into, cuts the call mid-stream, and injects a correction so the task carries on."
+  }
+}
