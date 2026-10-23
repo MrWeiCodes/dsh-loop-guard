@@ -415,7 +415,20 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
         agent.steer(message(s.steer(s.detail(reason)), 'notice', s.stallSummary(reason)))
         return
       case 'cancel':
-        agent.cancel(config.cancelCause as unknown as AgentCancelCause)
+        // `AgentCancelCause` is a discriminated union of OBJECTS, not a string:
+        // `{ kind: 'user' } | { kind: 'parent' } | { kind: 'hook', reason } |
+        // { kind: 'disposed' }`. Passing the bare `cancelCause` string used to
+        // satisfy the type checker only through an `as unknown as` cast, and the
+        // host then crashed: `abortedCancelCause` switches on `cause.kind`,
+        // which is `undefined` for a string, and the `default` arm calls
+        // `assertNever` -> `unreachable variant: "thinking-loop"`.
+        //
+        // `hook` is the only variant that carries a free-form reason, so the
+        // user's configured `cancelCause` rides there and stays visible in the
+        // session's `turn/end` record. The annotation is deliberate: it makes
+        // the compiler reject a bare string if anyone reintroduces the cast.
+        const cause: AgentCancelCause = { kind: 'hook', reason: config.cancelCause }
+        agent.cancel(cause)
         return
     }
   }
