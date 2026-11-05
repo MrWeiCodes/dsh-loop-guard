@@ -58,24 +58,20 @@
  * `maxRepeatedText` therefore adds an intra-call breaker: count consecutive
  * identical normalized `text-delta` payloads and, on the Nth, **end the stream
  * from inside the `llm/stream` wrapper** by yielding a terminal `finish` chunk
- * and returning. Two facts make that expressible and safe, both verified on
- * 0.1.5-alpha.1 and re-checked against the 0.1.2-rc.1 typings:
+ * and returning. What makes that expressible is the agent loop consuming the
+ * waterfall's iterable (`for await (const chunk of stream) live.push(chunk)`), so
+ * a listener's own chunk reaches the same assembler as an adapter's — verified on
+ * 0.1.5-alpha.1 and re-checked against the 0.1.2-rc.1 typings. Emitting an
+ * explicit `finish` is what states the call ended on purpose; an assembler would
+ * otherwise fall back to `stop` on its own, which conflates a deliberate cut with
+ * a stream that just ran out.
  *
- *  - The agent loop consumes the waterfall's iterable (`for await (const chunk
- *    of stream) live.push(chunk)`), so a listener's own chunk reaches the same
- *    assembler as an adapter's.
- *  - `packages/llm/llm/src/invariant.ts` requires a terminal finish chunk and
- *    explicitly permits an `error`/`aborted` finish with blocks still open — so
- *    a mid-call cut is a sanctioned protocol outcome, not a violation. A stream
- *    that simply ends is an invariant failure, which is why the breaker emits a
- *    finish rather than merely returning.
- *
- * The break is always an `error` finish carrying `REPETITIVE_OUTPUT`: it fails
- * the step through the loop's normal error path (and the `agent/request-error`
- * waterfall, where a retry policy may act on the code). A quiet `stop` is not
- * offered, because the breaker fires with the call's text block still open and
- * the invariant admits only `error`/`aborted` finishes in that state — measured,
- * not assumed. `breakCorrection` steers the agent so the resumed turn is told
+ * The break closes every open block and finishes with `stop`, so the call takes
+ * the loop's ordinary path and commits a real `assistant/message`. An `error`
+ * finish was tried and rejected: it settles as an `assistant/attempt` with no
+ * message, which the conversation renderer cannot draw, and it throws out of
+ * `turn()` before the queued correction can be claimed. `breakCode` is the label
+ * the break logs. `breakCorrection` steers the agent so the resumed turn is told
  * what happened. Deliberately **no model fallback and no automatic retry**: a
  * degenerate model must not be silently re-billed.
  *
@@ -414,14 +410,12 @@ export interface Config {
    */
   minRepeatedTextLineConcentration?: number
   /**
-   * Error code carried by the breaker's terminal failure. Default
+   * Label the breaker stamps on its warning when it cuts a call. Default
    * `'REPETITIVE_OUTPUT'`.
    *
-   * There is deliberately no way to choose a quiet `stop` finish instead: the
-   * breaker fires while the call's text block is still open, and the `llm/stream`
-   * invariant rejects a `stop` finish with open blocks (only `error`/`aborted`
-   * may leave them open). Verified by running the wrapper's own output through
-   * `@deepseek-ai/dsh-llm/invariant` — see `test/text-breaker.spec.mjs`.
+   * Only the log line carries it: the break itself ends the call with a `stop`
+   * finish, so nothing reaches the step as a failure and no retry policy sees a
+   * code to act on.
    */
   breakCode?: string
   /**
@@ -1267,4 +1261,4 @@ export class TextRepetitionDetector {
     return true
   }
 }
-
+

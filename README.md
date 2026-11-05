@@ -99,7 +99,7 @@ DSH **0.1.7** 把「上下文」类消息**从聊天区可见行里排除了**�
 | 会话 | **存活**，agent 回到 `idle`，可直接继续 |
 | 已执行的工具调用 | **保留**（`tool/result` 不回滚） |
 | 注入的提示 | 一条 `notice`，说明「已连续重复 N 字符，响应被中途截断，不要重复，继续完成任务」 |
-| 终止 chunk | 协议合法：切断前先闭合所有 block，再用 `stop` 结束，已用 DSH 自己的 `@deepseek-ai/dsh-llm/invariant` 验证 |
+| 终止 chunk | 协议合法：切断前先闭合所有 block，再用 `stop` 结束，已用 DSH 自己的 `BlockAssembler` 验证 |
 
 所以体验是：**循环 → 在几百字符处被切断 → 提示它回到任务 → 继续干活**。
 
@@ -278,7 +278,7 @@ interface Config {
   minRepeatedTextLineConcentration?: number
 
   // ── 切断后的行为 ──────────────────────────────────────────
-  /** 日志里标注的错误码。默认 'REPETITIVE_OUTPUT'。（切断本身走 `stop`，不产生错误） */
+  /** 切断时 warn 日志里标注的标签。默认 'REPETITIVE_OUTPUT'。（切断本身走 `stop`，不产生错误） */
   breakCode?: string
   /** 切断时注入一条纠正提示，让模型回到原任务。默认 true。 */
   breakCorrection?: boolean
@@ -525,7 +525,7 @@ npm test          # 运行测试套件
 
 测试包含三类：纯函数与静态断言、通过真实 `llm/stream` 链路的运行时断言，以及**用真实会话片段做的反例回归**（`test/fixtures-reasoning-bleed.json`，含实测周期 89–235 的循环样本与「高 `repeatRatio` 但无周期」的正常样本）。
 
-其中一条测试会把插件产出的终止 chunk 送进 DSH 自己的 `@deepseek-ai/dsh-llm/invariant` 校验——因为切断时推理 block 还开着，只有 `error`/`aborted` 才被允许。
+其中一条测试会把插件产出的终止 chunk 送进 DSH 自己的 `BlockAssembler` 组装——因为切断时推理 block 还开着，插件得自己补 `block-end`，提交的才是它选定的那段内容，而不是宿主从增量里重组的。
 
 如需自定义或修改插件，直接使用 DSH 的 Creator mode 即可快速开发。
 

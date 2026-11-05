@@ -58,24 +58,20 @@
  * `maxRepeatedText` therefore adds an intra-call breaker: count consecutive
  * identical normalized `text-delta` payloads and, on the Nth, **end the stream
  * from inside the `llm/stream` wrapper** by yielding a terminal `finish` chunk
- * and returning. Two facts make that expressible and safe, both verified on
- * 0.1.5-alpha.1 and re-checked against the 0.1.2-rc.1 typings:
+ * and returning. What makes that expressible is the agent loop consuming the
+ * waterfall's iterable (`for await (const chunk of stream) live.push(chunk)`), so
+ * a listener's own chunk reaches the same assembler as an adapter's — verified on
+ * 0.1.5-alpha.1 and re-checked against the 0.1.2-rc.1 typings. Emitting an
+ * explicit `finish` is what states the call ended on purpose; an assembler would
+ * otherwise fall back to `stop` on its own, which conflates a deliberate cut with
+ * a stream that just ran out.
  *
- *  - The agent loop consumes the waterfall's iterable (`for await (const chunk
- *    of stream) live.push(chunk)`), so a listener's own chunk reaches the same
- *    assembler as an adapter's.
- *  - `packages/llm/llm/src/invariant.ts` requires a terminal finish chunk and
- *    explicitly permits an `error`/`aborted` finish with blocks still open — so
- *    a mid-call cut is a sanctioned protocol outcome, not a violation. A stream
- *    that simply ends is an invariant failure, which is why the breaker emits a
- *    finish rather than merely returning.
- *
- * The break is always an `error` finish carrying `REPETITIVE_OUTPUT`: it fails
- * the step through the loop's normal error path (and the `agent/request-error`
- * waterfall, where a retry policy may act on the code). A quiet `stop` is not
- * offered, because the breaker fires with the call's text block still open and
- * the invariant admits only `error`/`aborted` finishes in that state — measured,
- * not assumed. `breakCorrection` steers the agent so the resumed turn is told
+ * The break closes every open block and finishes with `stop`, so the call takes
+ * the loop's ordinary path and commits a real `assistant/message`. An `error`
+ * finish was tried and rejected: it settles as an `assistant/attempt` with no
+ * message, which the conversation renderer cannot draw, and it throws out of
+ * `turn()` before the queued correction can be claimed. `breakCode` is the label
+ * the break logs. `breakCorrection` steers the agent so the resumed turn is told
  * what happened. Deliberately **no model fallback and no automatic retry**: a
  * degenerate model must not be silently re-billed.
  *
@@ -436,32 +432,12 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
   /**
    * End one in-flight model call from inside the stream wrapper.
    *
-   * The synthesized `finish` is the part that must not be skipped: the agent
-   * loop feeds every chunk this wrapper yields into the same assembler an
-   * adapter feeds, and `packages/llm/llm/src/invariant.ts` requires a terminal
-   * finish chunk while explicitly allowing `error`/`aborted` to leave blocks
-   * open. Returning without one would violate that grammar.
-   *
-   * Order matters — steer first, then return the terminal chunk. The user
-   * message must be durably enqueued *before* the `error` finish throws out of
-   * the step, so the resumed turn that the loop's `turn/end` finally block
-   * schedules (`if (!this.inbox.hasPending) return false`) claims it. The error
-   * path reaches `turn/end` through `throwError` without passing a turn-stopping
-   * idle check, so this ordering is what makes the correction survive.
-   *
-   * @param agent - the live agent that owns the call.
-   * @param chars - visible-output characters emitted before the break.
-   * @returns the terminal chunk to yield as the call's last.
-   */
-  /**
-   * End one in-flight model call from inside the stream wrapper.
-   *
    * ## Why the call is closed, not failed
    *
    * An earlier version ended the call with a terminal `error` finish. That is
-   * legal at the stream level — `llm/invariant` permits `error`/`aborted` to
-   * leave blocks open — but it produces a session shape the rest of the harness
-   * cannot handle, in two independent ways:
+   * legal at the stream level — an `error`/`aborted` finish may leave blocks
+   * open — but it produces a session shape the rest of the harness cannot
+   * handle, in two independent ways:
    *
    *  1. **The client cannot render it.** `agent-loop` settles an `error` finish
    *     as an `assistant/attempt` and appends no `assistant/message`
@@ -483,9 +459,6 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
    * `assistant/message`, the client renders it, and `turn()` returns normally so
    * pending steering opens the next turn.
    *
-   * The invariant requires `open.size === 0` for a `stop` finish, which is
-   * exactly what closing the blocks establishes.
-   *
    * @param agent - the live agent that owns the call.
    * @param repeated - characters of REPETITION, not the call's total length. The
    *   two differ by 1.6x-10.1x on measured firings, and the notice is about the
@@ -501,14 +474,15 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
     rule: BreakRule,
     open: readonly { index: number; blockType: string; text: string }[],
   ): StreamChunk[] | null {
-    // A `stop` finish is only legal with no open block, so every open block must
-    // be closed. That is safe for text/reasoning, whose payload this wrapper
-    // accumulated. It is NOT safe for a tool-call: closing one would commit a
-    // half-streamed call into `message.content`, and `step()` executes any
-    // tool-call block it finds — running a call whose arguments are still
-    // truncated JSON. Leaving it open fails the invariant instead. Neither is
-    // acceptable, so the break is abandoned; the post-call detectors still
-    // apply, and a few more repeated characters are cheaper than a bad call.
+    // Closing is safe for text/reasoning, whose payload this wrapper accumulated.
+    // It is NOT safe for a tool-call: closing one would commit a half-streamed
+    // call into `message.content`, and `step()` executes every tool-call block it
+    // finds — running a call whose arguments are still truncated JSON. Leaving it
+    // open does not avoid that either, because `BlockAssembler` assembles an open
+    // tool-call from its accumulated deltas, so the truncated call reaches
+    // `message.content` anyway. Neither is acceptable, so the break is abandoned;
+    // the post-call detectors still apply, and a few more repeated characters are
+    // cheaper than a bad call.
     if (open.some((block) => block.blockType !== 'text' && block.blockType !== 'reasoning')) {
       ctx.logger.warn(`loop-guard: repetition detected but a non-text block is open; not breaking (rule: ${rule})`)
       return null
@@ -585,9 +559,9 @@ export function apply(ctx: Context, config: ResolvedConfig): void {
       let hasOutput = false
       const textBreaker = new TextRepetitionDetector(config)
       const reasoningBreaker = new ReasoningLoopBreaker(config)
-      // Blocks still open, in stream order. A break has to close them itself:
-      // `llm/invariant` rejects a `stop` finish while any block is open, and the
-      // committed content of each block comes from the `block-end` payload.
+      // Blocks still open, in stream order. A break emits a `block-end` for each
+      // so the committed content of a block is the payload this wrapper chose,
+      // rather than whatever the host would reassemble from the deltas it saw.
       const open = new Map<number, { blockType: string; text: string }>()
       const openBlocks = () => [...open.entries()].map(([index, b]) => ({ index, ...b }))
       for await (const chunk of next()) {

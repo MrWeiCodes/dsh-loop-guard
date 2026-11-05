@@ -14,7 +14,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { markAgentLoopRequest } from '@deepseek-ai/dsh-llm'
+import { markAgentLoopRequest, BlockAssembler } from '@deepseek-ai/dsh-llm'
 import * as plugin from '../lib/index.js'
 import { TextRepetitionDetector, countRepeatedText } from '../lib/index.js'
 
@@ -153,7 +153,7 @@ test('a repetitive single call is cut short by closing its block', async () => {
   const finish = out.at(-1)
 
   assert.equal(deltas.length, 4, 'the stream must stop at the threshold, not run to the model max_tokens')
-  assert.equal(finish.type, 'finish', 'the last chunk must be terminal — a bare return violates the llm invariant')
+  assert.equal(finish.type, 'finish', 'the break must state the finish reason, not leave the assembler to fall back')
   // A closed call, not a failed one: `error` would settle as an `assistant/attempt`
   // with no `assistant/message`, which the conversation renderer cannot draw, and
   // `turn()` would throw before it could claim the queued correction.
@@ -166,7 +166,7 @@ test('the terminal finish is the last chunk: nothing follows it', async () => {
   const out = await collect(fakeAgent(), 50)
   const at = out.findIndex(c => c.type === 'finish')
   assert.ok(at > 0, 'a finish must be emitted')
-  assert.equal(at, out.length - 1, 'the invariant rejects any chunk after terminal finish')
+  assert.equal(at, out.length - 1, 'no chunk may follow the terminal finish')
 })
 
 test('the pending deltas after the break are dropped, not flushed', async () => {
@@ -197,8 +197,8 @@ test('`breakCorrection: false` still breaks but says nothing', async () => {
 /**
  * A Cordis-shaped context whose `llm/stream` listeners form the real chain.
  *
- * `prepend` listeners are called first (the shipped invariant registers that
- * way), so the array order here IS the wrapper nesting the llm service builds.
+ * `prepend` listeners run outermost, matching the order the llm service builds
+ * its waterfall in, so the array order here IS the wrapper nesting.
  */
 function chainContext(agent) {
   const listeners = []
@@ -215,17 +215,21 @@ function chainContext(agent) {
   return { ctx, listeners }
 }
 
-/** Install the shipped dsh-llm invariant, returning the failures it records. */
-async function installInvariant(context) {
-  const { apply } = await import('@deepseek-ai/dsh-llm/invariant')
-  const failures = []
-  const fail = m => failures.push(m)
-  const inner = new Proxy(context, { get: (t, k) => (k === 'on' ? t.on.bind(t) : t[k]) })
-  await apply(
-    { ...inner, invariants: { register: (_name, installer) => installer(inner, fail) } },
-    fail,
-  )
-  return failures
+/**
+ * Assemble the emitted chunks the way `agent-loop` does, returning the blocks a
+ * client would render.
+ *
+ * `agent-loop` feeds every chunk this wrapper yields into `BlockAssembler` and
+ * builds its `assistant/message` from `blocks()`. Running the break's output
+ * through that same class is what makes "the break is protocol-legal" assertable
+ * against the host rather than against a copy of its rules: the committed content
+ * of a block is the `block-end` payload when one arrives, and only the deltas
+ * otherwise.
+ */
+function assemble(out) {
+  const assembler = new BlockAssembler()
+  for (const chunk of out) assembler.push(chunk)
+  return assembler.blocks()
 }
 
 /** Drive one raw stream through the whole installed chain. */
@@ -238,23 +242,25 @@ async function runChain(listeners, options, source) {
   return out
 }
 
-test('the break finish is protocol-legal: the shipped llm invariant accepts it', async () => {
-  // The breaker fires with the call's text block still OPEN. The invariant fails
-  // a `stop` finish while any block is open, so the break closes the block first;
-  // this runs the wrapper's own output through the real validator instead of
-  // trusting a reading of the source — an earlier bare `stop` got exactly this
-  // wrong ("finished with 1 open block(s)").
+test('the break finish is protocol-legal: the host assembler accepts it', async () => {
+  // The breaker fires with the call's text block still OPEN, so the break emits
+  // its own `block-end` and a `stop` finish. This runs that output through the
+  // real assembler to pin what the host actually commits, instead of trusting a
+  // reading of the source.
   const { ctx, listeners } = chainContext(fakeAgent())
-  const failures = await installInvariant(ctx)
   plugin.apply(ctx, CONFIG)
-  assert.equal(listeners.length, 2, 'the chain must be invariant -> plugin')
+  assert.equal(listeners.length, 1, 'the chain must contain the plugin')
 
   const options = markAgentLoopRequest({ sessionId: 's1', provider: 'p', model: 'm', messages: [] })
   const seen = await runChain(listeners, options, () => textStream(50))
 
-  assert.deepEqual(failures, [], 'the synthesized finish must not violate the stream grammar')
   assert.equal(seen.at(-1).type, 'finish')
   assert.equal(seen.at(-1).reason.kind, 'stop')
+
+  const blocks = assemble(seen)
+  assert.equal(blocks.length, 1, 'exactly one block is committed')
+  assert.equal(blocks[0].type, 'text')
+  assert.ok(blocks[0].text.length > 0, 'the committed block carries the text that was emitted')
 })
 
 test('an UNBROKEN repetitive call would have failed only at the provider ceiling', async () => {

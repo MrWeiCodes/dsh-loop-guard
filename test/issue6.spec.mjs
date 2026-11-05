@@ -11,14 +11,10 @@
  * The path had no test coverage at all, which is why it shipped.
  *
  * Issue #6's second claim — that a delta-only stream lets the break commit a
- * truncated tool call — does **not** hold. `@deepseek-ai/dsh-llm/invariant`
- * requires every delta to address an open block:
- *
- *   text delta at index 0 requires an open text block, got undefined
- *
- * so a delta-only stream is a protocol violation before the guard ever sees it,
- * and both shipped adapters emit `block-start`. Nothing to fix, no assertion
- * added for it.
+ * truncated tool call — does **not** hold. Both shipped adapters open every
+ * block with `block-start` before its first delta, so the guard always sees the
+ * block and can refuse to close a tool-call it did not watch finish. Nothing to
+ * fix, no assertion added for it.
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

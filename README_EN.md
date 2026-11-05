@@ -102,7 +102,7 @@ In the trajectory view (the `CONTEXT` row):
 | The session | **survives**; the agent returns to `idle` and remains usable |
 | Tool calls already made | kept (`tool/result` is not rolled back) |
 | Injected notice | a `notice` explaining that N characters repeated and were cut, and to carry on with the task |
-| Terminal chunk | protocol-legal: every open block is closed first, then a `stop` finish — verified against DSH's own `@deepseek-ai/dsh-llm/invariant` |
+| Terminal chunk | protocol-legal: every open block is closed first, then a `stop` finish — verified against DSH's own `BlockAssembler` |
 
 So the experience is: **loop → cut within a few hundred characters → the model is pointed back at its task → work continues**.
 
@@ -289,7 +289,7 @@ interface Config {
   minRepeatedTextLineConcentration?: number
 
   // ── behaviour after a cut ─────────────────────────────────
-  /** Error code on a mid-stream break. Default 'REPETITIVE_OUTPUT'. */
+  /** Label on the warning logged when a call is cut. Default 'REPETITIVE_OUTPUT'. (The cut itself finishes with `stop`, so no error is raised.) */
   breakCode?: string
   /** Steer once after a cut so the resumed turn is corrected. Default true. */
   breakCorrection?: boolean
@@ -536,7 +536,7 @@ npm test          # run the suite
 
 The suite has three kinds of assertion: pure-function and static checks, runtime checks through a real `llm/stream` chain, and **counter-example regressions built from real session fragments** (`test/fixtures-reasoning-bleed.json`, carrying bleeds with measured periods of 89–235 and a "high `repeatRatio` but no period" normal sample).
 
-One test feeds the plugin's terminal chunk into DSH's own `@deepseek-ai/dsh-llm/invariant`, because the cut happens with the reasoning block still open and only `error`/`aborted` is permitted there.
+One test feeds the plugin's terminal chunk into DSH's own `BlockAssembler`, because the cut happens with the reasoning block still open — the plugin supplies its own `block-end` so what gets committed is the text it chose, not what the host reassembles from the deltas.
 
 To customize or modify the plugin, use DSH's Creator mode.
 

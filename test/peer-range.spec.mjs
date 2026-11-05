@@ -7,7 +7,7 @@ const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url),
 
 /**
  * Every `@deepseek-ai/dsh-agent` / `@deepseek-ai/dsh-llm` version published as
- * of 2026-09-23, oldest first; `npm view @deepseek-ai/dsh-agent versions`
+ * of 2026-11-05, oldest first; `npm view @deepseek-ai/dsh-agent versions`
  * refreshes it.
  *
  * The list is deliberately frozen: it is a record of what the range was checked
@@ -24,7 +24,11 @@ const PUBLISHED = [
   '0.1.5-alpha.1', '0.1.5-alpha.2', '0.1.5-rc.1', '0.1.5-rc.2', '0.1.5-rc.3',
   '0.1.6-alpha.1', '0.1.6-alpha.2',
   '0.1.7-alpha.1', '0.1.7-alpha.2', '0.1.7-rc.1', '0.1.7-rc.2',
-  '0.2.0-rc.1',
+  '0.2.0-rc.1', '0.2.0-rc.2',
+  '0.2.1-alpha.1', '0.2.1-alpha.2', '0.2.1-alpha.3', '0.2.1-alpha.4',
+  '0.2.1-alpha.5', '0.2.1-rc.1', '0.2.1-rc.2', '0.2.1-rc.3', '0.2.1-rc.4',
+  '0.2.1-rc.5',
+  '0.2.2-alpha.2', '0.2.2-alpha.3', '0.2.2-rc.1',
 ]
 
 /**
@@ -47,7 +51,11 @@ const SUPPORTED = [
   '0.1.5-alpha.1', '0.1.5-alpha.2', '0.1.5-rc.1', '0.1.5-rc.2', '0.1.5-rc.3',
   '0.1.6-alpha.1', '0.1.6-alpha.2',
   '0.1.7-alpha.1', '0.1.7-alpha.2', '0.1.7-rc.1', '0.1.7-rc.2',
-  '0.2.0-rc.1',
+  '0.2.0-rc.1', '0.2.0-rc.2',
+  '0.2.1-alpha.1', '0.2.1-alpha.2', '0.2.1-alpha.3', '0.2.1-alpha.4',
+  '0.2.1-alpha.5', '0.2.1-rc.1', '0.2.1-rc.2', '0.2.1-rc.3', '0.2.1-rc.4',
+  '0.2.1-rc.5',
+  '0.2.2-alpha.2', '0.2.2-alpha.3', '0.2.2-rc.1',
 ]
 
 /**

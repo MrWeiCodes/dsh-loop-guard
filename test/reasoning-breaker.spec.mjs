@@ -24,10 +24,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import { join, dirname } from 'node:path'
-import { markAgentLoopRequest } from '@deepseek-ai/dsh-llm'
+import { markAgentLoopRequest, BlockAssembler } from '@deepseek-ai/dsh-llm'
 import * as plugin from '../lib/index.js'
 import { ReasoningLoopBreaker, trailingCycle, periodicTailSpan } from '../lib/index.js'
 
@@ -261,10 +260,11 @@ test('a reasoning bleed is cut by closing its block, not by failing the call', a
   assert.ok(warnings.some((w) => w.includes('reasoning-cycle')))
 })
 
-test('the break leaves no block open, so the invariant accepts the stop finish', async () => {
-  // The invariant fails a `stop` finish while any block is open, so "no block
-  // left open" is the precise property that makes the break legal. Tracked here
-  // directly rather than inferred from the finish reason.
+test('the break closes every block it had open', async () => {
+  // The committed content of a block is its `block-end` payload, so a break that
+  // left one open would hand the host whatever it reassembled from deltas instead
+  // of the text the guard chose. Tracked here directly rather than inferred from
+  // the finish reason.
   const { stream } = host()
   const out = await drive(stream, reasoningChunks(BLEED))
   const open = new Set()
@@ -359,8 +359,8 @@ test('coherent reasoning is never cut', async () => {
 
 /**
  * A Cordis-shaped context whose `llm/stream` listeners form the real chain.
- * `prepend` listeners run first because the shipped invariant registers that
- * way, so this array order IS the wrapper nesting the llm service builds.
+ * `prepend` listeners run outermost, matching the order the llm service builds
+ * its waterfall in, so the array order here IS the wrapper nesting.
  */
 function chainContext(agent) {
   const listeners = []
@@ -377,17 +377,21 @@ function chainContext(agent) {
   return { ctx, listeners }
 }
 
-/** Install the shipped dsh-llm invariant, returning the failures it records. */
-async function installInvariant(context) {
-  const { apply } = await import('@deepseek-ai/dsh-llm/invariant')
-  const failures = []
-  const fail = (m) => failures.push(m)
-  const inner = new Proxy(context, { get: (t, k) => (k === 'on' ? t.on.bind(t) : t[k]) })
-  await apply(
-    { ...inner, invariants: { register: (_name, installer) => installer(inner, fail) } },
-    fail,
-  )
-  return failures
+/**
+ * Assemble the emitted chunks the way `agent-loop` does, returning the blocks a
+ * client would render.
+ *
+ * `agent-loop` feeds every chunk this wrapper yields into `BlockAssembler` and
+ * builds its `assistant/message` from `blocks()`. Running the break's output
+ * through that same class is what makes "the break is protocol-legal" assertable
+ * against the host rather than against a copy of its rules: the committed content
+ * of a block is the `block-end` payload when one arrives, and only the deltas
+ * otherwise.
+ */
+function assemble(out) {
+  const assembler = new BlockAssembler()
+  for (const chunk of out) assembler.push(chunk)
+  return assembler.blocks()
 }
 
 /** Drive one raw stream through the whole installed chain. */
@@ -406,24 +410,26 @@ async function* reasoningStream(text, size = 32) {
   }
 }
 
-test('the reasoning cut is protocol-legal: the shipped llm invariant accepts it', async () => {
-  // The breaker fires with the call's reasoning block still OPEN. The invariant
-  // fails a `stop` finish while any block is open, so this runs the wrapper's own
-  // output through the real validator rather than trusting a reading of the
-  // source — that is exactly how the original `stop` attempt was caught
-  // ("finished with 1 open block(s)").
+test('the reasoning cut is protocol-legal: the host assembler accepts it', async () => {
+  // The breaker fires with the call's reasoning block still OPEN, so the break
+  // emits its own `block-end` and a `stop` finish. This runs that output through
+  // the real assembler to pin what the host actually commits, instead of trusting
+  // a reading of the source.
   const agent = { steer: () => {}, inject: () => {}, cancel: () => {} }
   const { ctx, listeners } = chainContext(agent)
-  const failures = await installInvariant(ctx)
   plugin.apply(ctx, CONFIG)
-  assert.equal(listeners.length, 2, 'the chain must be invariant -> plugin')
+  assert.equal(listeners.length, 1, 'the chain must contain the plugin')
 
   const options = markAgentLoopRequest({ sessionId: 's1', provider: 'p', model: 'm', messages: [] })
   const seen = await runChain(listeners, options, () => reasoningStream(BLEED))
 
-  assert.deepEqual(failures, [], 'the synthesized finish must not violate the stream grammar')
   assert.equal(seen.at(-1).type, 'finish')
   assert.equal(seen.at(-1).reason.kind, 'stop')
+
+  const blocks = assemble(seen)
+  assert.equal(blocks.length, 1, 'exactly one block is committed')
+  assert.equal(blocks[0].type, 'reasoning')
+  assert.ok(blocks[0].text.length > 0, 'the committed block carries the reasoning that was emitted')
 })
 
 test('the break never aborts the agent', async () => {
@@ -596,34 +602,6 @@ test('an open tool-call block aborts the break instead of committing it', async 
     warnings.some((w) => w.includes('non-text block is open')),
     'the refusal must be logged, not silent',
   )
-})
-
-test('the break output assembles into a non-empty message through the real BlockAssembler', async () => {
-  // The end-to-end property the client depends on: the chunks the break emits
-  // must assemble into real content, because the renderer builds its
-  // `assistant-step` node from a settled message and throws if a step it already
-  // materialized produces none. Asserted through the harness's own assembler
-  // rather than by re-reading the chunk list, so the block-end payload shape is
-  // validated too.
-  const require = createRequire(import.meta.url)
-  const { BlockAssembler } = await import(
-    new URL('lib/types/assembler.js', `file://${require.resolve('@deepseek-ai/dsh-llm/package.json').replace(/package\.json$/, '')}`).href
-  )
-  const agent = { steer: () => {}, inject: () => {}, cancel: () => {} }
-  const { ctx, listeners } = chainContext(agent)
-  plugin.apply(ctx, CONFIG)
-  const options = markAgentLoopRequest({ sessionId: 's1', provider: 'p', model: 'm', messages: [] })
-  const seen = await runChain(listeners, options, () => reasoningStream(BLEED))
-
-  const assembler = new BlockAssembler()
-  for (const chunk of seen) assembler.push(chunk)
-  const blocks = assembler.blocks()
-  assert.ok(blocks.length > 0, 'the assembled message must not be empty')
-  assert.ok(
-    blocks.every((b) => typeof b.text === 'string' && b.text.length > 0),
-    'every assembled block must carry content',
-  )
-  assert.equal(assembler.finish.kind, 'stop')
 })
 
 /* -------------------------------------------------------------------------- */
